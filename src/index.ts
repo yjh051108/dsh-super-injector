@@ -129,7 +129,8 @@ const SCAFFOLD_TSCONFIG = `{
     "forceConsistentCasingInFileNames": true,
     "sourceMap": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["src/client"]
 }
 `
 
@@ -363,10 +364,14 @@ export function apply(ctx: Context, config: Config): void {
 const SCAFFOLD_UI_CLIENT = (pkgName: string): string => `/**
  * ${pkgName} — client 面板（conversation.view slot）。
  * 构建：npm run build:client（tsdown，产物 lib/client.js，ModuleLoader.load 注册）。
- * ⚠️ 两个必坑（2026-08 实测）：① apply 用 ctx.slots 必须 export const inject
- * = ['slots']（服务注入声明）；② register 必须带 name 字段（= slot 名，
- * 如 conversation.view）——缺 name 报 "slot undefined is not declared"。
+ * ⚠️ 三个必坑（2026-08 实测，含 issue #4 blank page）：① apply 用 ctx.slots
+ * 必须 export const inject = ['slots']（服务注入声明）；② register 必须带 name
+ * 字段（= slot 名，如 conversation.view）——缺 name 报 "slot undefined is
+ * not declared"；③ register 是双参契约 register(options, component)，component
+ * 必须是返回合法 React 元素的**函数组件**（内部 jsx(Comp, props) 直接调用）——
+ * 旧式单参 component: () => ({ render() {} }) 会把页面渲染成空白。
  */
+import { createElement } from 'react'
 import type { SlotsService } from '@deepseek-ai/dsh-client-ui-slots'
 
 type ClientContext = {
@@ -375,22 +380,17 @@ type ClientContext = {
 
 export const inject = ['slots']
 
+function Panel(): any {
+  return createElement('div', { style: { padding: '12px', fontFamily: 'monospace' } }, ${JSON.stringify(pkgName)} + ' 面板（host API: /${pkgName}/api）')
+}
+
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.slots.inject('conversation.view', () =>
     ctx.slots.register({
       name: 'conversation.view',
       id: '${pkgName}-panel',
       label: () => ${JSON.stringify(pkgName)},
-      component: () => ({
-        render() {
-          const el = document.createElement('div')
-          el.textContent = ${JSON.stringify(pkgName)} + ' 面板（host API: /${pkgName}/api）'
-          el.style.padding = '12px'
-          el.style.fontFamily = 'monospace'
-          return el
-        },
-      }),
-    }),
+    }, Panel),
   ), '${pkgName}: panel')
 }
 `
@@ -3178,18 +3178,45 @@ export function apply(ctx: AppContext, config: Config): void {
   // client-modules 首次扫描时 junction 可能未建 → resolvePkgJson 抛 →
   // pkgMeta 缓存 null（进程级永久，无官方清缓存 API）→ client 永不注册
   // （设置页「插件」不出现）。junction 已建立后：清缓存 + 重解析注册。
-  try {
-    const cmSvc = ctx.get('clientModules') as {
-      pkgMeta?: Map<string, unknown>
-      processOne?: (name: string) => unknown
-    } | undefined
-    if (cmSvc?.pkgMeta && typeof cmSvc.pkgMeta.delete === 'function') {
+  // ⚠️ 自重载时序（2026-08-15 实测，issue #4 根因③）：apply 期间自身 entry
+  // 可能仍带 disabled 标记，processOne 会误删表行；且 processOne 只改 table、
+  // 不重组合图（composed）→ boot manifest 缺行 → 设置页入口丢失。修复：
+  // 延迟到 fiber 激活后再清缓存 → processOne → rebuilt（重算 rev + 重组
+  // 合图 + 通知），保证 client-modules compose 与表一致。
+  const healClientMeta = (): void => {
+    try {
+      const root = (ctx.root ?? ctx) as any
+      const cmSvc = root.get('clientModules') as {
+        pkgMeta?: Map<string, unknown>
+        table?: Map<string, unknown>
+        processOne?: (name: string) => unknown
+        compose?: () => unknown
+        composed?: unknown
+        notifyGraphChanged?: () => void
+      } | undefined
+      if (!cmSvc?.pkgMeta || typeof cmSvc.pkgMeta.delete !== 'function') return
       cmSvc.pkgMeta.delete('@dsh-external/dsh-super-injector')
       if (typeof cmSvc.processOne === 'function') {
         cmSvc.processOne('@dsh-external/dsh-super-injector')
-        auditLog('client-meta-healed', 'client-modules pkgMeta 缓存已清并重解析（设置页插件管理 UI 注册）')
       }
+      // 表行恢复后必须显式重组合图：processOne 只写 table，不改 composed；
+      // rebuilt 在同 rev 时会提前 return，也不重组合图——直接用 compose 赋值
+      // + notifyGraphChanged，保证 boot manifest 与 table 一致。
+      if (cmSvc.table?.has('@dsh-external/dsh-super-injector')) {
+        cmSvc.composed = cmSvc.compose?.()
+        cmSvc.notifyGraphChanged?.()
+      }
+      auditLog('client-meta-healed', 'client-modules pkgMeta 缓存已清并重解析（设置页插件管理 UI 注册）')
+    } catch (e) {
+      auditLog('client-meta-heal-failed', String(e))
     }
+  }
+  try {
+    // 冷启动立即执行一次；自重载场景补一发延迟执行，等自身 fiber 激活、
+    // disabled 清掉后重试（幂等：table 已有行时 processOne 不重复加，
+    // compose+notify 重复执行也安全）。
+    healClientMeta()
+    globalThis.setTimeout(() => healClientMeta(), 1000)
   } catch { /* 缓存自愈失败不阻塞 */ }
 
   // ═══════════════════════════════════════════════════════════════════
