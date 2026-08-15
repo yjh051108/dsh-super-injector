@@ -5,6 +5,19 @@
 > **版本以 git tag 为准**：已发布 v0.3.1 / v0.3.3（GitHub Releases 资产）；未打 tag 的
 > 小节为开发史（其内容随下一个发布一并交付）。
 
+## [0.3.4] — 2026-08-16
+
+### 修复（patch 去重误删顶层 config 块——8/15 实测事故根治）
+
+- **extractPatchBlocks 缩进误判根治**：`- id:` 正则无锚点，insert 块内缩进的子条目被当成
+  顶层条目，与同 id 的顶层 config 块（如 dsh-vision 的 baseURL/model）判重后把后者删掉——
+  实测事故：web profile 的 dsh-vision 后端配置被 dev_fix_patch 吃掉，view_image 回落到智谱
+  默认端点，商汤 key 打到智谱报 401「令牌已过期或验证不正确」。修复：顶层条目只认第 0 列；
+  缩进 `- id:`（insert 子条目 / group config 子条目）一律按嵌套条目分桶，与顶层去重互不干扰
+- **去重保留语义对齐**：writePatch / dev_fix_patch / fix-patch.mjs 注释声称「保留最后一条」
+  但代码实际保留第一条——统一改为倒序保留最后一条（与 loader 顺序覆盖语义一致）
+- **顶格注释保留**：dev_fix_patch 重写时不再丢弃文件头注释
+
 ## [0.3.3] — 2026-08-15（已发布，git tag v0.3.3）
 
 ### 更新（高性能引导升级为 P1-P23 完整认知）

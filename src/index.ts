@@ -739,14 +739,20 @@ export function apply(ctx: AppContext, config: Config): void {
       // 2. 提取现有内容里所有条目块（含注释），按 id 归组
       const blocks = extractPatchBlocks(content)
       const existing = new Set<string>()
+      // 顶层与嵌套（insert 子条目 / group config）分桶去重，保留最后一条（与
+      // loader 顺序覆盖语义一致）；existing 收集全部 id 供幂等判断
+      const keyOf = (b: { id?: string; fromInsert?: boolean }) => (b.fromInsert ? 'nested:' : 'top:') + b.id
+      const seen = new Set<string>()
       const kept: string[] = []
-      for (const b of blocks) {
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        const b = blocks[i]
         if (b.id) {
-          // 同 id 重复：只保留最后一条（后续同名覆盖先前的）
-          if (existing.has(b.id)) continue
           existing.add(b.id)
+          const k = keyOf(b)
+          if (seen.has(k)) continue
+          seen.add(k)
         }
-        kept.push(b.text)
+        kept.unshift(b.text)
       }
       // 3. 幂等：appendIds 全部已存在 → 不写入
       if (appendIds.length > 0 && appendIds.every((id) => existing.has(id))) {
@@ -763,31 +769,38 @@ export function apply(ctx: AppContext, config: Config): void {
 
   /** 把 patch 内容切分为"条目块"（`- id:` 及其缩进子行 + 前置注释行）。
    * 每块文本保留行尾换行，块间 join 不粘连；顶格注释单独成块（不并入前一条目，
-   * 否则重写时注释会与下一条目粘连成一行、后续 `disabled: true` 等错挂条目）。 */
-  function extractPatchBlocks(content: string): Array<{ id?: string; text: string }> {
+   * 否则重写时注释会与下一条目粘连成一行、后续 `disabled: true` 等错挂条目）。
+   * 顶层条目只认第 0 列的 `- id:`；缩进的 `- id:`（insert 子条目 / group config
+   * 子条目）打 fromInsert 标记，去重时与顶层分桶——避免把同 id 的顶层 config 块
+   * （如 dsh-vision 的 baseURL/model）误当重复删掉（2026-08-15 事故）。 */
+  function extractPatchBlocks(content: string): Array<{ id?: string; fromInsert?: boolean; text: string }> {
     const lines = content.split('\n')
-    const blocks: Array<{ id?: string; text: string }> = []
-    let current: { id?: string; text: string } | null = null
+    const blocks: Array<{ id?: string; fromInsert?: boolean; text: string }> = []
+    let current: { id?: string; fromInsert?: boolean; text: string } | null = null
     for (const line of lines) {
-      const idMatch = /^\s*- id:\s*([^\s#]+)/.exec(line)
-      if (idMatch) {
+      const trimmed = line.trim()
+      if (trimmed === '') {
+        if (current) current.text += line + '\n'
+        continue
+      }
+      const atCol0 = line[0] !== ' ' && line[0] !== '\t'
+      const idMatch = /^-\s+id:\s*([^\s#]+)/.exec(line)
+      if (atCol0 && idMatch) {
         if (current) blocks.push(current)
-        current = { id: idMatch[1], text: line + '\n' }
+        current = { id: idMatch[1], fromInsert: false, text: line + '\n' }
+      } else if (idMatch) {
+        // 缩进 `- id:`：insert/group 的嵌套子条目，去重时与顶层分桶
+        if (current) blocks.push(current)
+        current = { id: idMatch[1], fromInsert: true, text: line + '\n' }
+      } else if (atCol0) {
+        // 顶格注释/杂散行：结束当前块，单独成块保留（防止与下一条目粘连）
+        if (current) blocks.push(current)
+        current = null
+        if (!/^\s*\[\]\s*$/.test(trimmed)) blocks.push({ text: line + '\n' })
       } else if (current) {
-        if (/^\s/.test(line) || line.trim() === '') {
-          // 条目缩进子行或空行：留在当前块
-          current.text += line + '\n'
-        } else {
-          // 顶格注释/杂散行：结束当前块，单独成块保留（防止与下一条目粘连）
-          blocks.push(current)
-          current = null
-          blocks.push({ text: line + '\n' })
-        }
-      } else if (line.trim() !== '' && !/^\s*#/.test(line) && !/^\s*\[\]\s*$/.test(line)) {
-        // 非注释、非空、非条目的杂散行：保留原样（如 - insert: 包裹行）
-        blocks.push({ text: line + '\n' })
-      } else if (line.trim() !== '' && !/^\s*\[\]\s*$/.test(line)) {
-        // 顶格注释单独成块
+        // 条目缩进子行：留在当前块
+        current.text += line + '\n'
+      } else {
         blocks.push({ text: line + '\n' })
       }
     }
@@ -2537,7 +2550,7 @@ export function apply(ctx: AppContext, config: Config): void {
 
   safeRegister(defineTool({
     name: 'dev_fix_patch',
-    description: 'profile patch 修复：扫描 ~/.dsh/profiles/*/cordis.patch.yml，按 entry id 去重（同 id 保留最后一条，备份原文件）——修复 "duplicate loader entry id" 启动崩溃（手动 patch 两次/重复安装造成）。--check 只查不写',
+    description: 'profile patch 修复：扫描 ~/.dsh/profiles/*/cordis.patch.yml，顶层与嵌套条目（insert 子条目/group config）分桶去重（同 id 保留最后一条，备份原文件）——修复 "duplicate loader entry id" 启动崩溃（手动 patch 两次/重复安装造成）。--check 只查不写',
     parameters: {
       profile: { type: 'string', description: '只修指定 profile（缺省全部）' },
       check: { type: 'boolean', description: '只检查不写入' },
@@ -2562,29 +2575,42 @@ export function apply(ctx: AppContext, config: Config): void {
         let content = ''
         try { content = readFileSync(patchFile, 'utf8') } catch { out.push(`[${profile}] 读取失败（跳过）`); continue }
         const blocks = extractPatchBlocks(content)
-        const seen = new Set<string>()
-        const kept: string[] = []
-        const dup: Array<{ id: string; count: number }> = []
+        // 顶层与嵌套（insert 子条目 / group config）分桶去重：防止同 id 的顶层
+        // config 块被 insert 子条目误判为重复而删掉（2026-08-15 事故）
+        const keyOf = (b: { id?: string; fromInsert?: boolean }) => (b.fromInsert ? 'nested:' : 'top:') + b.id
+        const counts = new Map<string, number>()
         for (const b of blocks) {
-          if (b.id) {
-            if (seen.has(b.id)) {
-              const rec = dup.find((r) => r.id === b.id)
-              if (rec) rec.count += 1
-              else dup.push({ id: b.id, count: 1 })
-              continue
-            }
-            seen.add(b.id)
+          if (!b.id) continue
+          const k = keyOf(b)
+          counts.set(k, (counts.get(k) ?? 0) + 1)
+        }
+        const dup: Array<{ id: string; fromInsert: boolean; count: number }> = []
+        for (const [k, n] of counts) {
+          if (n > 1) {
+            const sep = k.indexOf(':')
+            dup.push({ id: k.slice(sep + 1), fromInsert: k.startsWith('nested:'), count: n - 1 })
           }
-          kept.push(b.text)
         }
         if (!dup.length) { out.push(`[${profile}] 健康：无重复 id`); continue }
         fixedAny = true
-        for (const rec of dup) out.push(`[${profile}] 修复：id "${rec.id}" 重复，删除 ${rec.count} 条（保留最后一条）`)
+        for (const rec of dup) out.push(`[${profile}] 修复：${rec.fromInsert ? '嵌套条目 ' : ''}id "${rec.id}" 重复，删除 ${rec.count} 条（保留最后一条）`)
         if (args.check) continue
         const bak = patchFile + '.bak-' + Date.now()
         try {
           renameSync(patchFile, bak)
-          writeFileSync(patchFile, kept.join('\n').replace(/\s*$/, '') + '\n', 'utf8')
+          // 保留最后一条（与 loader 顺序覆盖语义一致）：倒序保留首次出现
+          const seen = new Set<string>()
+          const kept: string[] = []
+          for (let i = blocks.length - 1; i >= 0; i--) {
+            const b = blocks[i]
+            if (b.id) {
+              const k = keyOf(b)
+              if (seen.has(k)) continue
+              seen.add(k)
+            }
+            kept.unshift(b.text)
+          }
+          writeFileSync(patchFile, kept.join('').replace(/\s*$/, '') + '\n', 'utf8')
           out.push(`[${profile}] 已重写（备份: ${bak}）`)
         } catch (e) {
           out.push(`[${profile}] 写入失败: ${String(e instanceof Error ? e.message : e)}`)
