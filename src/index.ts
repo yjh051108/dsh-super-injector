@@ -1375,8 +1375,10 @@ export function apply(ctx: AppContext, config: Config): void {
       const opts = entry.options
       if (opts.group) continue
       const state = entry.fiber ? (FIBER_NAMES[entry.fiber.state] ?? `state:${entry.fiber.state}`) : 'no-fiber'
-      const entryUrl = [...ctx.loader.internal!.loadCache.keys()]
-        .find(u => typeof u === 'string' && u.includes(opts.id))
+      // 守卫：loader.internal 仅在 --expose-internals 启动时存在（Web GUI 不带此 flag）
+      const entryUrl = ctx.loader.internal?.loadCache
+        ? [...ctx.loader.internal.loadCache.keys()].find(u => typeof u === 'string' && u.includes(opts.id))
+        : undefined
       // 注入插件标记 [injected]（与 bundle 装配区分，避免 hash id 难认）
       const injected = injectedNames.has(opts.name) ? ' [injected]' : ''
       lines.push(`- [${state}] ${opts.id} (${opts.name})${injected}${opts.disabled ? ' [disabled]' : ''}${entryUrl ? '\n    entry: ' + entryUrl : ''}`)
