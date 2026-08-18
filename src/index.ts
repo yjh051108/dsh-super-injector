@@ -3193,7 +3193,7 @@ export function apply(ctx: AppContext, config: Config): void {
   } catch { /* 缓存自愈失败不阻塞 */ }
 
   // ═══════════════════════════════════════════════════════════════════
-  // 插件管理 UI API（settings.section 页面后端）
+  // 插件管理 UI API（官方设置页 settings.plugins.tab 二级标签后端）
   // 端点：GET /list（registry+状态+统计）、POST /uninstall{match}、
   //       POST /inject{dir}、POST /ingest{dir,title}（新建会话内化）
   // ═══════════════════════════════════════════════════════════════════
