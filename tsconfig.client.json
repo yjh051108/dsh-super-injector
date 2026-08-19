@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "noEmit": true,
+    "rootDir": "src/client",
+    "types": ["node", "react", "react-dom"]
+  },
+  "include": ["src/client"],
+  "exclude": []
+}
