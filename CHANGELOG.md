@@ -5,6 +5,15 @@
 > **版本以 git tag 为准**：已发布 v0.3.1 / v0.3.3（GitHub Releases 资产）；未打 tag 的
 > 小节为开发史（其内容随下一个发布一并交付）。
 
+## [Unreleased]
+
+### 修复
+
+- **`dev_heal_links` 悬空 junction 误报「全部健康」修复（issue #19）**：删除守卫改用
+  `lstatSync` 判断链接本身存在——`existsSync` 跟随链接检查目标，对悬空 junction 返回
+  false，残留坏链接删除失败、重建撞 EEXIST 被吞，误报「全部健康」。与注入路径
+  `dev_inject_plugin` 的既有写法保持一致。
+
 ## [0.3.3] — 2026-08-15（已发布，git tag v0.3.3）
 
 ### 更新（高性能引导升级为 P1-P23 完整认知）

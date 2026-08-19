@@ -2224,9 +2224,15 @@ export function apply(ctx: AppContext, config: Config): void {
         const linkDir = join(profileNodeModules, scope ?? '')
         const linkPath = join(linkDir, scope ? name.split('/')[1] as string : name)
         if (!isHealthyLink(linkPath)) {
-          try {
-            if (existsSync(linkPath)) rmdirSync(linkPath)
-          } catch { /* 坏链接删除失败忽略 */ }
+          // ⚠️ 悬空 junction 的删除守卫必须用 lstatSync 判断链接本身存在：
+          // existsSync 跟随链接检查目标，对悬空 junction 返回 false → 残留坏
+          // 链接不删除 → 随后 symlinkSync 撞 EEXIST 失败被吞 → 误报全部健康。
+          // 与注入路径 dev_inject_plugin 的写法保持一致。
+          let linkExists = false
+          try { linkExists = lstatSync(linkPath).isSymbolicLink() || lstatSync(linkPath).isDirectory() } catch { /* 不存在 */ }
+          if (linkExists) {
+            try { rmSync(linkPath, { recursive: true, force: true }) } catch { /* 删除失败尝试覆盖 */ }
+          }
           try {
             mkdirSync(linkDir, { recursive: true })
             symlinkSync(target, linkPath, 'junction')
