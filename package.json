@@ -21,7 +21,8 @@
     "lib",
     "cordis.patch.yml",
     "scripts/build.sh",
-    "scripts/fix-patch.mjs"
+    "scripts/fix-patch.mjs",
+    "scripts/prepare.mjs"
   ],
   "license": "BSD-3-Clause",
   "dsh": {
@@ -48,6 +49,7 @@
   },
   "scripts": {
     "build": "bash scripts/build.sh",
+    "prepare": "node scripts/prepare.mjs",
     "build:client": "tsdown",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   }

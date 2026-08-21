@@ -46,7 +46,15 @@ dsh plugin --profile web add <解压目录>
 dsh plugin --profile web add github:yjh051108/dsh-super-injector
 ```
 
+> git 依赖拉取的是源码仓库（不含 `lib/`）；包内 `prepare` 钩子会在安装时自动
+> 用 tsdown 构建自包含 `lib/`（首次需要网络拉取 tsdown，之后走本地缓存）。
+> 若构建失败，请改用方式 A 的 Release tgz（预构建产物）。
+
 ### 方式 C：引导装配（源码方式，只需一次）
+
+> ⚠️ 仅限未走 bundles 装配时使用：注入器自带 bundle 层会自注册
+> `dsh-super-injector`，与下方手动 `insert` 撞同一个 loader entry id，会报
+> `duplicate loader entry id`。走方式 A/B 装配后请勿再加这一条。
 
 在 `~/.dsh/profiles/web/cordis.patch.yml` 添加：
 
