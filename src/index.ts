@@ -52,7 +52,7 @@ cd "$ROOT"
 # DSH_CHECKOUT 探测：环境变量 → 常见路径（home 下 dsh-harness）
 CHECKOUT="\${DSH_CHECKOUT:-}"
 if [ -z "$CHECKOUT" ]; then
-  for candidate in "\$HOME/dsh-harness" "\$HOME/dsh" "\$HOME/.dsh/dsh-harness"; do
+  for candidate in "\$HOME/dsh-harness" "\$HOME/dsh" "\$HOME/.dsh/dsh-harness" "\$HOME/deepseek-harness"; do
     if [ -d "\$candidate/packages" ]; then CHECKOUT="\$candidate"; break; fi
   done
 fi
@@ -2712,6 +2712,7 @@ export function apply(ctx: AppContext, config: Config): void {
       join(homedir(), 'dsh-harness'),
       join(homedir(), 'dsh'),
       join(homedir(), '.dsh', 'dsh-harness'),
+      join(homedir(), 'deepseek-harness'),
     ]
     for (const c of candidates) {
       if (existsSync(join(c, 'packages'))) return c
