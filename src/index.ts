@@ -2519,6 +2519,45 @@ export function apply(ctx: AppContext, config: Config): void {
   }))
 
   safeRegister(defineTool({
+    name: 'dev_reload_preset',
+    description: '预设热更新（agent-presets 新一代，绕 ESM 缓存）：给 .agent-presets/<preset>/agent.cordis.yml 的相对 .mjs 引用加 ?v=N query（N 自增）——组合文件指纹变化 → 新会话挂载新一代 → 新 URL 无缓存命中 → 改代码无需换文件名/重启即可生效。已运行会话保持旧代。',
+    parameters: {
+      preset: { type: 'string', description: '预设 id（缺省 = 全部）' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
+    },
+    async execute(args: { preset?: string }) {
+      const presetsRoot = join(dshHome, '.agent-presets')
+      const names = args.preset
+        ? [args.preset]
+        : (() => { try { return readdirSync(presetsRoot).filter((d) => !d.startsWith('.')) } catch { return [] } })()
+      if (!names.length) return 'ERROR: 未找到任何预设（' + presetsRoot + '）'
+      const out: string[] = []
+      for (const name of names) {
+        const ymlFile = join(presetsRoot, name, 'agent.cordis.yml')
+        if (!existsSync(ymlFile)) { out.push('[' + name + '] 无 agent.cordis.yml（跳过）'); continue }
+        let yml = ''
+        try { yml = readFileSync(ymlFile, 'utf8') } catch { out.push('[' + name + '] 读取失败（跳过）'); continue }
+        const refRe = /(name: \.\/[A-Za-z0-9._-]+\.mjs)(\?v=\d+)?/g
+        const refs = [...yml.matchAll(refRe)]
+        if (!refs.length) { out.push('[' + name + '] 无相对 .mjs 引用（无需热更新）'); continue }
+        const changed: string[] = []
+        for (const m of refs) {
+          const base = m[1]
+          const cur = m[2] ? Number(m[2].slice(3)) : 0
+          yml = yml.replace(m[0], base + '?v=' + (cur + 1))
+          changed.push(base.split('/').pop() + ' -> ?v=' + (cur + 1))
+        }
+        try { writeFileSync(ymlFile, yml, 'utf8') } catch { out.push('[' + name + '] 写入失败（跳过）'); continue }
+        out.push('[' + name + '] ' + changed.join(', '))
+      }
+      return 'OK: 预设热更新\n- ' + out.join('\n- ') + '\n注：新会话挂载新一代（新 URL 绕 ESM 缓存）；已运行会话保持旧代'
+    },
+  }))
+
+  safeRegister(defineTool({
     name: 'dev_heal_links',
     description: 'profile link: 依赖 junction 自愈（手动触发，免重启）：扫描 profile package.json 全部 link: 依赖（bundles 装配依赖 + agent preset 解析依赖），悬空/缺失的 node_modules junction 重建。返回重建清单。',
     parameters: {},
