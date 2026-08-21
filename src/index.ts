@@ -1979,8 +1979,9 @@ export function apply(ctx: AppContext, config: Config): void {
   }
 
   /** 卸载一个已注入的插件包：卸 entry（fiber dispose）→ 清 registry → 删 junction。 */
-  async function uninject(match: string): Promise<string> {
-    if (match.includes('super-injector')) return 'ERROR: 拒绝卸载 dsh-super-injector 自身（引导器不可卸载）'
+  async function uninject(match: string, allowSelf = false): Promise<string> {
+    // 自举卸载（allowSelf）：卸运行时 entry，保留 registry/junction/bundles 装配链，重启自动装回。
+    if (match.includes('super-injector') && !allowSelf) return 'ERROR: 拒绝卸载 dsh-super-injector 自身（引导器不可卸载；自举卸载需 self=true）'
     const steps: string[] = []
     let fullName: string | null = null
     // 1. loader entry 卸载（同时捕获完整包名）
@@ -2003,7 +2004,7 @@ export function apply(ctx: AppContext, config: Config): void {
     // ⚠️ 必须解析式追加（实测踩坑）：官方 patch 文件初始是顶层 `[]`（空数组），
     // 若盲 append `- id:` 会产生**两个顶层 YAML 值** → 解析必炸。正确做法：
     // 移除顶层 `[]` 空数组后再追加条目，保证文件始终是单一顶层值（列表）。
-    if (fullName) {
+    if (fullName && !allowSelf) {
       const idShort = fullName.split('/').pop()
       if (idShort) {
         // ⚠️ 幂等：已存在同名 disabled 条目则跳过（否则重复卸载会累积条目——
@@ -2030,7 +2031,7 @@ export function apply(ctx: AppContext, config: Config): void {
       steps.push('registry 已清理')
     }
     // 3. junction 删除（用完整包名构建路径；rmdir 只删链接不删目标）
-    if (fullName) {
+    if (fullName && !allowSelf) {
       const parts = fullName.startsWith('@') ? fullName.split('/') : [fullName]
       const linkDir = join(profileNodeModules, ...parts)
       try {
@@ -2449,15 +2450,16 @@ export function apply(ctx: AppContext, config: Config): void {
     description: '超级模组卸载器：卸载已注入的插件包——卸 loader entry（fiber dispose，工具/监听全清理）→ 清注入清单 → 删 profile junction → 另写 profile patch disabled 条目（防 include.refresh 加回），免重启。参数 = 包名子串（如 dsh-toy-supermod）',
     parameters: {
       match: { type: 'string', required: true, description: '包名/路径子串（如 dsh-toy-supermod 或 @dsh-external/dsh-toy-supermod）' },
+      self: { type: 'boolean', description: '自举卸载（仅对 dsh-super-injector 自身）：卸运行时 entry，保留 registry/junction/bundles 装配链，重启后自动装回' },
     },
     output: {
       schema: { type: 'string' },
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
     },
-    async execute(args: { match: string }) {
+    async execute(args: { match: string; self?: boolean }) {
       const match = String(args?.match ?? '').trim()
       if (!match) return 'ERROR: match 必填（包名/路径子串）'
-      return withOpLock(() => uninject(match))
+      return withOpLock(() => uninject(match, Boolean(args.self)))
     },
   }))
 
