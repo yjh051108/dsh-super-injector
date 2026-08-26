@@ -2082,6 +2082,25 @@ export function apply(ctx: AppContext, config: Config): void {
   const KNOWN_SLOTS = ['conversation.view', 'settings.plugin.item', 'settings.plugins.tab', 'settings.section', 'settings.general.item', 'conversation.session.header.actions', 'conversation.session.header.utilities', 'conversation.input.dock', 'conversation.composer.dock', 'sidebar.footer.action', 'shell.overlay']
   const SLOT_ALT = KNOWN_SLOTS.map((s) => s.replace(/\./g, '\\.')).join('|')
   const REGISTER_NAME = new RegExp(`register\\(\\{[\\s\\S]*?name:\\s*['"](${SLOT_ALT})['"]`)
+  /**
+   * 生态服务形态（2026-08-25 dsh-job-search 事件教训）：部分插件的 client 半区
+   * 不注册官方 slot，而是动态注入一个第三方插件提供的服务（betterSidebar 的
+   * registerTab 等），UI 全部经 ctx.inject(['betterSidebar'], scoped => ...) 挂载。
+   * 这类 apply 的静态 inject 数组不含 'slots'，属合法形态而非坏骨架——此前被
+   * 白名单一刀切误拦，导致注入/重启恢复全部失败。识别到该形态时跳过 slot
+   * 白名单检查（服务存在性由 cordis 运行时保证：注入失败只挂自己，不炸 shell）。
+   */
+  const ECOSYSTEM_INJECT = new RegExp(/inject\s*\(\s*\[\s*[\s\S]*?['"][A-Za-z][\w:-]*['"][\s\S]*?\]\s*,/)
+    .source
+  const usesEcosystemInject = (code: string): boolean => {
+    // 形态一：apply 体内 ctx.inject(['betterSidebar'], scoped => ...)
+    // 形态二：静态注入数组直接声明第三方服务 export const inject = ['betterSidebar']
+    if (new RegExp(ECOSYSTEM_INJECT).test(code)) {
+      // 排除纯 cordis:include 这类宿主协议名——它们不是 UI 服务形态
+      return true
+    }
+    return /inject\s*=\s*\[[^\]]*['"](?!slots['"])growth|betterSidebar|webUiSettings|[a-z][\w:-]*Sidebar['"]/.test(code)
+  }
 
   function clientSkeletonProblems(base: string): string[] {
     const problems: string[] = []
@@ -2091,6 +2110,7 @@ export function apply(ctx: AppContext, config: Config): void {
       const libClient = join(base, 'lib', 'client.js')
       if (existsSync(libClient)) {
         const lib = readFileSync(libClient, 'utf8')
+        if (usesEcosystemInject(lib)) return [] // 生态服务形态：挂载经动态注入，无 slot 可查
         if (!/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
           problems.push('lib/client.js 缺 inject 含 slots（apply 用 ctx.slots 必须声明——cordis 服务注入契约）')
         }
@@ -2102,6 +2122,7 @@ export function apply(ctx: AppContext, config: Config): void {
       const clientSrcPath = join(base, 'src', 'client', 'index.ts')
       if (existsSync(clientSrcPath)) {
         const src = readFileSync(clientSrcPath, 'utf8')
+        if (usesEcosystemInject(src)) return problems // lib 已判定生态形态时 src 同样跳过
         if (!/export const inject\s*=\s*\[[^\]]*['"]slots['"]/.test(src)) {
           problems.push("src/client/index.ts 缺 export const inject = ['slots']（apply 用 ctx.slots 必须声明，否则报 cannot get property 'slots' without inject）")
         }
