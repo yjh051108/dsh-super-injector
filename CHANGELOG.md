@@ -2,8 +2,23 @@
 
 本项目版本与仓库提交对应，格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-> **版本以 git tag 为准**：已发布 v0.3.1 / v0.3.3（GitHub Releases 资产）；未打 tag 的
-> 小节为开发史（其内容随下一个发布一并交付）。
+> **版本以 git tag 为准**：带 GitHub Release 资产的标签为已发布版本；未打 tag 的小节为
+> 开发史（其内容随下一个发布一并交付）。
+
+## [0.3.4] — 2026-08-19
+
+### 修复
+
+- 将 Super Injector 的运行时插件管理页从重复的 `settings.section` 侧栏入口迁移到 DSH
+  原生“插件”页面的 `settings.plugins.tab`，标签名称为“运行时注入”。
+- 适配 DSH `0.1.0-rc.7` 的 `slots.register(options, component)` 两参数接口，使用 React
+  生命周期挂载现有管理界面，修复入口可见但页面空白的问题。
+- 页面卸载或热重载时清理 60 秒轮询定时器，并阻止已卸载视图的异步回调继续更新 DOM。
+
+### 验证
+
+- Vitest 客户端回归测试 4/4 通过，覆盖插槽注册、页面渲染、轮询清理和卸载后异步保护。
+- TypeScript Host/Client 类型检查通过，`tsdown` Host/Client bundle 构建通过。
 
 ## [0.3.3] — 2026-08-15（已发布，git tag v0.3.3）
 
