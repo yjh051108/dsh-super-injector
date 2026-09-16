@@ -561,6 +561,48 @@ function fingerprintOf(dir: string): string | null {
  * 后操作排队等前操作完成——避免同一插件被并发重载/卸载的竞态）。
  */
 let opChain: Promise<unknown> = Promise.resolve()
+/**
+ * bundle 契约预检（dev_install_package 用）：缺 `dsh.bundle`（patch）的包一旦被写进
+ * `dsh.profile.bundles`，boot loader 会硬失败
+ *   Error: dsh: profile bundle "<pkg>" declares no dsh.bundle in its package.json
+ * 并直接退出 → systemd `Restart=always` 每 3s 重启一轮 → **崩溃循环**。
+ * 2026-09-16 实测事故（@dsh-external/dsh-quick-restart）之后加的 fail-closed 闸：
+ * 契约不满足就拒绝装配，**不写 profile**，并提示用
+ * `node <插件目录>/scripts/preflight-bundle.mjs --fix` 自愈。
+ */
+function checkBundleContract(dir: string): { ok: boolean; problems: string[] } {
+  const problems: string[] = []
+  try {
+    const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+    const patch = pkg?.dsh?.bundle?.patch
+    if (typeof patch !== 'string' || patch.trim() === '') {
+      problems.push('package.json 缺 `dsh.bundle.patch`（bundle 层声明）')
+    } else {
+      const patchPath = resolve(dir, patch)
+      if (!existsSync(patchPath)) problems.push('patch 文件不存在：' + patch)
+      else {
+        const text = readFileSync(patchPath, 'utf8')
+        if (!/^\s*-\s*insert\s*:/m.test(text)) problems.push('patch 缺 `- insert:` 层')
+        else {
+          const body = text.split(/^\s*-\s*insert\s*:/m)[1] ?? ''
+          if (!/^\s+-\s+id\s*:/m.test(body)) problems.push('patch 的 insert 行缺 `id:`')
+          const m = /^\s+name\s*:\s*['"]?([^'"\s]+)['"]?/m.exec(body)
+          if (!m) problems.push('patch 的 insert 行缺 `name:`')
+          else if (m[1] !== pkg.name) problems.push('patch 的 name 与包名不一致：' + m[1] + ' ≠ ' + pkg.name)
+        }
+      }
+      const files = Array.isArray(pkg.files) ? pkg.files : []
+      const norm = String(patch).replace(/^\.\//, '')
+      if (!files.some((f: unknown) => typeof f === 'string' && f.replace(/^\.\//, '') === norm)) {
+        problems.push('package.json 的 `files` 未包含 patch 文件（打包会漏）')
+      }
+    }
+  } catch (e) {
+    problems.push('package.json 无法解析：' + String(e))
+  }
+  return { ok: problems.length === 0, problems }
+}
+
 function withOpLock<T>(fn: () => Promise<T> | T): Promise<T> {
   const run = opChain.then(() => fn(), () => fn())
   opChain = run.then(() => undefined, () => undefined)
@@ -1944,8 +1986,24 @@ export function apply(ctx: AppContext, config: Config): void {
     const linkDir = join(profileNodeModules, ...parts)
     try {
       let linkExists = false
-      try { linkExists = lstatSync(linkDir).isSymbolicLink() || lstatSync(linkDir).isDirectory() } catch { /* 不存在 */ }
-      if (!linkExists || !isHealthyLink(linkDir)) {
+      let isLink = false
+      try {
+        if (lstatSync(linkDir).isSymbolicLink()) { isLink = true; linkExists = true }
+        else if (lstatSync(linkDir).isDirectory()) linkExists = true
+      } catch { /* 不存在 */ }
+      if (linkExists && !isLink) {
+        // ⚠️ 真实目录：**绝不 rm -r**。若它本身就是目标包（profile 就地安装的包，链接路径 === 包路径），
+        // 直接就地加载即可；否则宁可报错，也不能删掉别人已安装的包。
+        // 教训：2026-09-16 注入 dsh-workspace-search（其目录就在 profile/node_modules 下）时，
+        // 旧逻辑 rmSync(recursive) 把真实包删掉、再建了一个自指向软链 → ELOOP，
+        // loader.create 报 Cannot find package，包内容只能从备份恢复。
+        let same = false
+        try { same = realpathSync(linkDir) === realpathSync(absDir) } catch { /* 拿不到就按不同处理 */ }
+        if (!same) {
+          return `ERROR: 拒绝注入 —— ${linkDir} 是真实目录（非链接），且与目标 ${absDir} 不是同一个包。`
+            + ' 注入器不会覆盖已安装的包：请把插件源码放在 node_modules 之外（如 ~/dsh-work/plugins/<name>），或用 bundles/patch 装配。'
+        }
+      } else if (!linkExists || !isHealthyLink(linkDir)) {
         if (linkExists) {
           try { rmSync(linkDir, { recursive: true, force: true }) } catch { /* 删除失败尝试覆盖 */ }
         }
@@ -2035,8 +2093,8 @@ export function apply(ctx: AppContext, config: Config): void {
       const parts = fullName.startsWith('@') ? fullName.split('/') : [fullName]
       const linkDir = join(profileNodeModules, ...parts)
       try {
-        if (existsSync(linkDir)) {
-          rmdirSync(linkDir)
+        if (lstatSync(linkDir, { throwIfNoEntry: false })) {
+          removeLinkPath(linkDir)
           steps.push('junction 已删除: ' + linkDir)
         } else {
           steps.push('（junction 不存在）')
@@ -2072,6 +2130,18 @@ export function apply(ctx: AppContext, config: Config): void {
     }
   }
 
+  /** 删除链接本身（绝不跟随、绝不删目标）。Windows junction 用 rmdir；
+   *  Linux 下 symlinkSync(...,'junction') 落成普通符号链接，rmdir 会 ENOTDIR（2026-09-16
+   *  Linux 下卸载这类插件时 rmdir 会 ENOTDIR，必须退回 unlink。 */
+  function removeLinkPath(link: string): void {
+    try {
+      rmdirSync(link)
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException | undefined)?.code === 'ENOTDIR') rmSync(link, { force: true })
+      else throw e
+    }
+  }
+
   /** 启动自动恢复：① bundle junction 断电自愈（profile packages 的 link:）→ ② 注入清单逐个重新注入。 */
   /** client 骨架校验（注入前 + autoRestore 恢复前共用——pixel-forge 事件教训：
    * 坏 client 插件在 registry → 新会话恢复 → apply 失败 → HARNESS 启动失败）。
@@ -2091,11 +2161,16 @@ export function apply(ctx: AppContext, config: Config): void {
       const libClient = join(base, 'lib', 'client.js')
       if (existsSync(libClient)) {
         const lib = readFileSync(libClient, 'utf8')
-        if (!/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
-          problems.push('lib/client.js 缺 inject 含 slots（apply 用 ctx.slots 必须声明——cordis 服务注入契约）')
-        }
-        if (!REGISTER_NAME.test(lib)) {
-          problems.push(`lib/client.js 的 register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}）`)
+        // slots 契约只在 client 真的使用 slots 服务时成立。用别的宿主服务（如 better-sidebar 的
+        // ctx.betterSidebar）的 client bundle 不含 'slots' 字样，会被白名单检查误判为坏骨架
+        // （2026-09-13 dsh-workspace-search 实例：client 注册进 betterSidebar，此检查阻断注入）。
+        if (/\bslots\b/.test(lib)) {
+          if (!/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
+            problems.push('lib/client.js 缺 inject 含 slots（apply 用 ctx.slots 必须声明——cordis 服务注入契约）')
+          }
+          if (!REGISTER_NAME.test(lib)) {
+            problems.push(`lib/client.js 的 register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}）`)
+          }
         }
       }
       // 2. 源码骨架（有 src 时）
@@ -2174,19 +2249,25 @@ export function apply(ctx: AppContext, config: Config): void {
       }
       // client 产物
       if (hasClient) {
-        const libClient = join(base, 'lib', 'client.js')
+        // 客户端入口按 exports["./client"] 解析（字符串或条件对象的 default），回退 lib/client.js——
+        // 核心 dsh-client-modules 的 clientExportOf() 正是这样解析，第三方包可自选路径
+        // （如 dshmarket 1.46.x 用 client/client.js；硬编码 lib/client.js 会误报"前端必挂"）。
+        const clientEntry = (pkg.exports as Record<string, unknown> | undefined)?.['./client']
+        const clientRaw = typeof clientEntry === 'string' ? clientEntry : (clientEntry as Record<string, unknown> | undefined)?.default
+        const clientRel = (typeof clientRaw === 'string' && clientRaw ? clientRaw : './lib/client.js').replace(/^\.\//, '')
+        const libClient = join(base, clientRel)
         if (!existsSync(libClient)) {
-          block.push('lib/client.js 不存在（package.json 声明了 dsh.client 但没构建 client——先 npm run build:client，否则前端必挂）')
+          block.push(`${clientRel} 不存在（package.json 声明了 dsh.client 但没构建 client——先 npm run build:client，否则前端必挂）`)
         } else {
           try {
             const content = readFileSync(libClient, 'utf8')
             if (!content.includes('__ModuleLoader__')) {
-              block.push('lib/client.js 不是 tsdown bundle（缺 __ModuleLoader__ 特征——可能被 tsc 覆盖或手改，重新 npm run build:client）')
+              block.push(`${clientRel} 不是 tsdown bundle（缺 __ModuleLoader__ 特征——可能被 tsc 覆盖或手改，重新 npm run build:client）`)
             }
             let mt = 0
             try { mt = statSync(libClient).mtimeMs } catch { /* 跳过 */ }
             if (clientLatest > 0 && clientLatest - mt > 8000) {
-              warn.push('lib/client.js 过期（src/client 修改晚于构建 8s+，疑似漏 npm run build:client——前端会加载旧 UI）')
+              warn.push(`${clientRel} 过期（src/client 修改晚于构建 8s+，疑似漏 npm run build:client——前端会加载旧 UI）`)
             }
           } catch { /* 读不到跳过 */ }
         }
@@ -2226,7 +2307,7 @@ export function apply(ctx: AppContext, config: Config): void {
         const linkPath = join(linkDir, scope ? name.split('/')[1] as string : name)
         if (!isHealthyLink(linkPath)) {
           try {
-            if (existsSync(linkPath)) rmdirSync(linkPath)
+            if (lstatSync(linkPath, { throwIfNoEntry: false })) removeLinkPath(linkPath)
           } catch { /* 坏链接删除失败忽略 */ }
           try {
             mkdirSync(linkDir, { recursive: true })
@@ -2684,6 +2765,22 @@ export function apply(ctx: AppContext, config: Config): void {
         const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
         const name = pkg.name
         if (typeof name !== 'string' || !name) return 'ERROR: package.json 缺 name'
+        // bundle 契约预检（缺 dsh.bundle 的包进 bundles = DSH 启动崩溃循环）→ fail closed
+        const contract = checkBundleContract(dir)
+        if (!contract.ok) {
+          // 约定：本闸 fail-closed 只服务「官方装配型」插件（需要 cordis.patch.yml 参与装配）。运行时注入型
+          // （只做运行时加载的那一类）本就不该进 dsh.profile.bundles
+          // → 走 dev_inject_plugin，别为了过闸去补 patch。所以文案先教分类，再给对应动作。
+          const preflight = join(dir, 'scripts', 'preflight-bundle.mjs')
+          const fixHint = existsSync(preflight)
+            ? 'node ' + preflight + ' --fix'
+            : '手写 cordis.patch.yml（- insert: / - id: / name: <包名>）并在 package.json 加 dsh.bundle.patch'
+          return 'ERROR: 拒绝装配 —— 该插件不满足 bundle 契约（直接写进 dsh.profile.bundles 会让 DSH 启动硬失败、3s 一轮崩溃循环）：\n- '
+            + contract.problems.join('\n- ')
+            + '\n先分类再动手：'
+            + '\n  · 官方装配型（本就该进 bundles、需要 cordis.patch.yml 参与装配）→ 补契约：' + fixHint
+            + '\n  · 运行时注入型（只做运行时加载、本就不该进 dsh.profile.bundles）→ 别补 patch，改走 dev_inject_plugin <插件目录>'
+        }
 
         const home = process.env.DSH_HOME || join(homedir(), '.dsh')
         const profileDir = join(home, 'profiles', profileName)
