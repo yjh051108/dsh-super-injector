@@ -18,7 +18,7 @@
  * broken lib/ is worse than one that stops with a clear message.
  */
 import { spawnSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -26,6 +26,64 @@ import { fileURLToPath } from 'node:url'
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const TSDOWN_RANGE = 'tsdown@^0.22.14'
 const REQUIRED = ['lib/index.js', 'lib/client.js']
+
+/**
+ * ★★★ **发布面脱敏：把构建机上的绝对路径换成 `<HOME>` 占位**（2026-09-19）
+ *
+ * 【为什么必须有这一步】`tsdown` 会把 bundle 进去的依赖写成
+ * `//#region C:/Users/<构建机用户名>/AppData/.../node_modules/…` 这类**注释**，
+ * 并在 `.map` 的 `sources` 里写同样的绝对路径
+ * ⇒ ★★ **那会把【构建机的用户名】带进发布件** —— 而它是**别人的机器上毫无用处的隐私** ❌
+ * ⇒ ⚠️ **实测**：`v0.3.4` 那份已发布的 tgz 里 `lib/index.js` 命中【构建机用户名】11 处
+ *
+ * 【判据】① 产物里**不再出现构建机的用户目录**（`C:/Users/<名>/` · `/home/<名>/` · `/Users/<名>/`）
+ *        ② ★ **运行时不依赖这些注释**（它们是 `//#region` 注释与 sourcemap 的 `sources`）
+ *        ③ ★★ **替换后 `node --check lib/index.js` 仍 exit=0**（**证明没改坏语法**）
+ */
+const HOME_PATH_RE = /(?:[A-Za-z]:[\\/]Users[\\/][^\\/\s"']+[\\/]|\/(?:home|Users)\/[^/\s"']+\/)/g
+
+function scrubBuildPaths() {
+  const targets = ['lib/index.js', 'lib/client.js', 'lib/index.js.map', 'lib/client.js.map']
+  let total = 0
+  for (const rel of targets) {
+    const abs = join(ROOT, rel)
+    if (!existsSync(abs)) continue
+    const before = readFileSync(abs, 'utf8')
+    const hits = (before.match(HOME_PATH_RE) ?? []).length
+    if (hits === 0) { console.log(`[prepare] scrub ${rel}: 无绝对路径 ✓`); continue }
+    const after = before.replace(HOME_PATH_RE, '<HOME>/')
+    writeFileSync(abs, after, 'utf8')
+    total += hits
+    console.log(`[prepare] scrub ${rel}: 替换 ${hits} 处构建机绝对路径`)
+  }
+  // 判据①：替换后再扫一遍，必须为 0
+  let left = 0
+  for (const rel of targets) {
+    const abs = join(ROOT, rel)
+    if (!existsSync(abs)) continue
+    left += (readFileSync(abs, 'utf8').match(HOME_PATH_RE) ?? []).length
+  }
+  if (left > 0) {
+    console.error(`[prepare] ✗ 脱敏后仍有 ${left} 处构建机路径 ⇒ 发布件不干净`)
+    return false
+  }
+  console.log(`[prepare] ✓ 脱敏完成（共替换 ${total} 处）`)
+  return true
+}
+
+function verifySyntax() {
+  const hosts = ['lib/index.js', 'lib/client.js'].filter((r) => existsSync(join(ROOT, r)))
+  for (const rel of hosts) {
+    const r = spawnSync(process.execPath, ['--check', join(ROOT, rel)], { stdio: 'pipe' })
+    if (r.status !== 0) {
+      console.error(`[prepare] ✗ ${rel} 语法检查失败（脱敏改坏了？）`)
+      console.error(String(r.stderr ?? '').split('\n').slice(0, 4).join('\n'))
+      return false
+    }
+  }
+  console.log('[prepare] ✓ node --check 通过（lib/index.js + lib/client.js）')
+  return true
+}
 
 function run(command, args, cwd = ROOT) {
   const result = spawnSync(command, args, { cwd, stdio: 'inherit', shell: process.platform === 'win32' })
@@ -50,6 +108,9 @@ function verifyOutputs() {
 function main() {
   if (verifyOutputs()) {
     console.log('[prepare] lib/ already built — skipping tsdown run')
+    // ★ 即使跳过构建，也要过脱敏与语法检查（**已构建的产物同样可能带路径**）
+    if (!scrubBuildPaths()) return 1
+    if (!verifySyntax()) return 1
     return 0
   }
 
@@ -73,6 +134,9 @@ function main() {
     console.error(`[prepare] build finished but ${REQUIRED.join(', ')} missing`)
     return 1
   }
+  // ★★★ 构建后两步（缺一则发布件不干净 / 可能被改坏）
+  if (!scrubBuildPaths()) return 1
+  if (!verifySyntax()) return 1
   return 0
 }
 
