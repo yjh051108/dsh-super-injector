@@ -556,14 +556,26 @@ function fingerprintOf(dir: string): string | null {
   }
 }
 
+/** 定时 resolve（unref：不为了等计时拖住进程退出）。 */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const t = globalThis.setTimeout(resolve, ms)
+    ;(t as any)?.unref?.()
+  })
+}
+
 /**
  * 操作互斥锁：注入/卸载/重载/安装全部串行执行（多会话并发调用注入器时，
  * 后操作排队等前操作完成——避免同一插件被并发重载/卸载的竞态）。
+ *
+ * 防毒化（案底 2026-09-07 挂死轮）：一次卡死的操作不能把后续所有注入/卸载
+ * 永久排队——链的推进最多等 OP_HOLD_MAX_MS，操作自身的超时接管负责诚实上报。
  */
 let opChain: Promise<unknown> = Promise.resolve()
+const OP_HOLD_MAX_MS = 30_000
 function withOpLock<T>(fn: () => Promise<T> | T): Promise<T> {
   const run = opChain.then(() => fn(), () => fn())
-  opChain = run.then(() => undefined, () => undefined)
+  opChain = Promise.race([run.then(() => undefined, () => undefined), sleep(OP_HOLD_MAX_MS)])
   return run
 }
 
@@ -700,6 +712,37 @@ export function apply(ctx: AppContext, config: Config): void {
       appendFileSync(selfHealLogFile, `[${new Date().toISOString()}] ${event}: ${detail}\n`)
     } catch { /* 审计写失败不阻塞 */ }
   }
+
+  // ═══ 未处理 rejection 常驻兜底（2026-09-12 崩溃循环案底）═══
+  // 案底：后侧工具里一个**未被 await 的 rejection** 逃出工具栈 → Node 默认把它升级成
+  // 未捕获异常 → 宿主 `dsh: fatal load failure` 退出 code=1 → 桌面壳无条件重启 → 崩溃循环，
+  // 用户体感「DSH 反反复复重启」。两次实测同型：SessionQueryError（本部署 session-query
+  // 配成 openAt:"never"，搜索被禁用）、以及负对照里故意造的 Promise.reject。
+  // ⚠️ 第一版修法（只在 dev_stage_call 的调用窗口内挂监听）**被负对照当场打红**：
+  //    unhandledRejection 是在微任务队列**排空之后**才上报的，`finally` 摘监听时它还没上报，
+  //    窗口一关等于没挂。故改为**常驻**：整个进程生命周期挂住，逃逸一律降级成日志 + 计数，
+  //    绝不升级成宿主退出。
+  // 代价（诚实标注）：宿主范围内任何 unhandledRejection 都不再崩进程 —— 会掩盖别处的 bug。
+  // 缓解：每次逃逸都落 self-heal.log，可审计、不静默。用 Symbol.for + globalThis 存状态，
+  // 热重载不会重复挂监听（否则每重载一次就多叠一层）。
+  try {
+    const SHIELD = Symbol.for('dsh.super-injector.rejection-shield')
+    const g = globalThis as unknown as Record<symbol, { count: number; handler: (reason: unknown) => void } | undefined>
+    if (!g[SHIELD]) {
+      const state = { count: 0, handler: (_reason: unknown): void => { /* 占位，下面立刻覆写 */ } }
+      state.handler = (reason: unknown): void => {
+        state.count += 1
+        const text = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)
+        auditLog('escaped-rejection', `#${state.count} ${String(text).slice(0, 400)}`)
+        try {
+          logger.warn('[super-injector] 未处理 rejection 已降级（宿主未退出）: %s', String(text).slice(0, 200))
+        } catch { /* 日志失败不阻断 */ }
+      }
+      process.on('unhandledRejection', state.handler)
+      g[SHIELD] = state
+      auditLog('rejection-shield', '常驻兜底已安装（unhandledRejection 不再导致宿主退出）')
+    }
+  } catch { /* 兜底安装失败不阻断插件 */ }
 
   /** 日志轮转（D）：超限后滚动 .1/.2，保留 2 代，防长期运行无限增长。 */
   function rotateLog(file: string): void {
@@ -877,6 +920,57 @@ export function apply(ctx: AppContext, config: Config): void {
     } catch (e) {
       logger.error('[super-injector] 自愈排程失败: %s', String(e))
     }
+  }
+
+  // ═══ 有界交接（防挂死安全网，2026-09-07 挂死案底轮）═══
+  /** 工具栈内允许等一次交换的时间；到点转后台继续，绝不拖死宿主。 */
+  const HANDOFF_MS = 6000
+  /** 后台收口账本（dev_plugin_status 公示——异步化不丢可观测性，不静默）。 */
+  const bgOps = new Map<string, { at: number; kind: string; state: string; detail: string }>()
+
+  /**
+   * 有界交接：工具调用栈内最多等 ms，到点不傻等——**同一个**操作继续在后台收口
+   * （不重复触发），结果写 bgOps + self-heal.log。
+   *
+   * 案底（开发者两次指出「reload 有问题会导致卡死」）：普通重载分支在工具栈里
+   * `await 目标 fiber.dispose()`，宿主整个挂死、只能重启。机制与本文件自重载处
+   * 既有结论同源（见「v0.3 最终形态：工具只排程、绝不亲自自杀」）：本次工具调用
+   * 占着 dsh-tools 调度槽，而 dispose 要等依赖该服务的 fiber 生命周期走完——互相
+   * 等待成环。自重载早已分离式重启器，普通重载漏了同一课。
+   * 纪律：任何「等别的 fiber 生命周期」的 await 都必须能被超时接管。
+   */
+  function handoff(kind: string, key: string, ms: number, task: () => Promise<string>): Promise<string> {
+    let settled = false
+    const note = (state: string, detail: string): void => {
+      bgOps.set(key, { at: Date.now(), kind, state, detail: detail.slice(0, 400) })
+      try {
+        auditLog(`${kind}-${state}`, `${key}: ${detail.slice(0, 200)}`)
+      } catch { /* 审计写失败不阻塞 */ }
+    }
+    const carry = (async () => task())().then(
+      (text) => ({ failed: false, text }),
+      (e: unknown) => ({ failed: true, text: 'ERROR: ' + (e instanceof Error ? (e.stack ?? e.message) : String(e)) }),
+    )
+    void carry.then((r) => { if (settled) note(r.failed ? 'bg-failed' : 'bg-done', r.text) })
+    return new Promise<string>((resolve) => {
+      const timer = globalThis.setTimeout(() => {
+        if (settled) return
+        settled = true
+        note('running', `超 ${ms}ms 未收口，转后台继续`)
+        resolve(
+          `WARN: ${kind} ${key} 未在 ${ms}ms 内收口（工具栈内等 fiber 生命周期有环风险——案底挂死轮），`
+          + '同一操作已转后台继续（未重复触发）。用 dev_plugin_status 看「后台操作」确认收口；'
+          + '若长期停在 running，说明旧代释放确实卡住，需重启宿主。',
+        )
+      }, ms)
+      ;(timer as any)?.unref?.()
+      void carry.then((r) => {
+        if (settled) return
+        settled = true
+        globalThis.clearTimeout(timer)
+        resolve(r.text)
+      })
+    })
   }
 
   async function reloadPackage(match: string, urlMatch?: string): Promise<string> {
@@ -1160,33 +1254,37 @@ export function apply(ctx: AppContext, config: Config): void {
         backup.set(u, loadCache.get(u))
         Map.prototype.delete.call(loadCache, u)
       }
+      let fresh: any
       try {
-        const fresh = ctx.loader.unwrapExports(await ctx.loader.import(entryUrlFinal, () => []))
-        for (const entry of ctx.loader.entries()) {
-          const opts = entry.options as { name?: string; id?: string }
-          if (opts?.name && String(opts.name).includes(match)) {
-            const fiber = entry.fiber
-            if (fiber && typeof fiber === 'object') {
-              // 尝试用新插件导出重建 fiber（entry 的 plugin 引用替换）
-              // ⚠️ 先 await 旧 fiber dispose（异步清理防注册竞态）
-              if (typeof fiber.dispose === 'function') {
-                try { await fiber.dispose() } catch { /* 忽略 */ }
-              }
-              const registry = (ctx as any).registry
-              if (registry && typeof registry.delete === 'function' && typeof registry.plugin === 'function') {
-                registry.delete(fiber)
-                const nf = registry.plugin(fresh, entry.options.config ?? {}, () => [])
-                nf.entry = entry
-                entry.fiber = nf
-              }
-            }
-          }
-        }
-        return `OK: ${match} 坏缓存兜底重载完成（无旧代回滚）`
+        fresh = ctx.loader.unwrapExports(await ctx.loader.import(entryUrlFinal, () => []))
       } catch (e) {
         for (const [u, job] of backup) loadCache.set(u, job)
         return 'ERROR: 兜底 import 失败，已恢复原缓存: ' + (e instanceof Error ? e.stack : String(e))
       }
+      const targets = [...ctx.loader.entries()].filter((en) => {
+        const o = en.options as { name?: string }
+        return o?.name && String(o.name).includes(match) && en.fiber
+      })
+      if (!targets.length) return `OK: ${match} 坏缓存兜底重载完成（无 fiber 需重建）`
+      // ⚠️ 交换走 handoff：dispose 旧 fiber 不能在工具栈里无界等（挂死案底轮）
+      return handoff('reload', match, HANDOFF_MS, async () => {
+        for (const entry of targets) {
+          const fiber = entry.fiber
+          if (!fiber || typeof fiber !== 'object') continue
+          // 先等旧 fiber 完全 dispose 再建新 fiber（防旧注册残留 → duplicate）
+          if (typeof fiber.dispose === 'function') {
+            try { await fiber.dispose() } catch { /* 忽略 */ }
+          }
+          const registry = (ctx as any).registry
+          if (registry && typeof registry.delete === 'function' && typeof registry.plugin === 'function') {
+            registry.delete(fiber)
+            const nf = registry.plugin(fresh, entry.options.config ?? {}, () => [])
+            nf.entry = entry
+            entry.fiber = nf
+          }
+        }
+        return `OK: ${match} 坏缓存兜底重载完成（无旧代回滚，重建 ${targets.length} fiber）`
+      })
     }
 
     const runtime = ctx.registry.get(oldPlugin)
@@ -1198,22 +1296,29 @@ export function apply(ctx: AppContext, config: Config): void {
         return o?.name && String(o.name).includes(match)
       })
       if (target?.fiber) {
+        // 顺序校准：先 purge+import、成功后才动旧代（原实现先 dispose 后 import，
+        // import 一失败就留下「旧代已死、新代没来」的无代可用状态）
+        const backup2 = new Map<string, any>()
+        for (const u of urls) {
+          backup2.set(u, loadCache.get(u))
+          Map.prototype.delete.call(loadCache, u)
+        }
+        let fresh2: any
         try {
-          if (typeof target.fiber.dispose === 'function') await target.fiber.dispose()
-          const backup2 = new Map<string, any>()
-          for (const u of urls) {
-            backup2.set(u, loadCache.get(u))
-            Map.prototype.delete.call(loadCache, u)
-          }
-          const fresh2 = ctx.loader.unwrapExports(await ctx.loader.import(entryUrlFinal, () => []))
+          fresh2 = ctx.loader.unwrapExports(await ctx.loader.import(entryUrlFinal, () => []))
+        } catch (e) {
+          for (const [u, job] of backup2) loadCache.set(u, job)
+          return 'ERROR: entry 重建 import 失败（旧代保留）: ' + (e instanceof Error ? e.stack : String(e))
+        }
+        const staleFiber = target.fiber as any
+        return handoff('reload', match, HANDOFF_MS, async () => {
+          if (staleFiber && typeof staleFiber.dispose === 'function') await staleFiber.dispose()
           const nf2 = ctx.registry.plugin(fresh2, target.options.config ?? {}, () => [])
           nf2.entry = target
           target.fiber = nf2
           normalizeEntriesByName(match)
           return `OK: registry 无 runtime，entry.fiber 直接重建（state=${nf2.state}）`
-        } catch (e) {
-          return 'ERROR: entry 重建失败: ' + (e instanceof Error ? e.stack : String(e))
-        }
+        })
       }
       return 'ERROR: registry 中无该插件 runtime 且 entry 无 fiber'
     }
@@ -1258,112 +1363,118 @@ export function apply(ctx: AppContext, config: Config): void {
 
     // dispose 旧 fiber + 重建（失败 → 尝试用旧插件恢复）
     // ⚠️ 快照 fiber 列表：runtime.fibers 是 DisposableList（活引用），
-    // 下方 await 旧 fiber dispose 会把 fiber 从列表移除——若直接遍历活
-    // 列表，重建循环看到的永远是空列表（实测「重建 0 fiber」）。快照
-    // 必须在 dispose 之前完成。
+    // dispose 旧 fiber 会把 fiber 从列表移除——若直接遍历活列表，重建循环
+    // 看到的永远是空列表（实测「重建 0 fiber」）。快照必须在 dispose 之前。
     const fibers = [...runtime.fibers] as any[]
-    const failures: string[] = []
-    let rebuilt = 0
-    try {
-      const config = currentConfigOf(fibers[0]?._config)
-      // ⚠️ 竞态修复：cordis 的 fiber.dispose() 是异步清理（_unload await disposables，
-      // 含 context/tools 注册注销）——必须先 await 旧 fiber 完全 dispose，
-      // 再建新 fiber，否则新 fiber apply 时旧注册残留 → duplicate（此前热
-      // 重载连环 "already registered" 的根因）。registry.delete 是 fire-and-forget，
-      // 所以这里直接 await entry.fiber 的 dispose（返回 disposalTask Promise）。
-      const entryForDispose = [...ctx.loader.entries()].find((en) => {
-        const o = en.options as { name?: string }
-        return o?.name && String(o.name).includes(match)
-      })
-      const oldFiberEntry = entryForDispose?.fiber
-      if (oldFiberEntry && typeof oldFiberEntry.dispose === 'function') {
-        try {
-          await oldFiberEntry.dispose()
-        } catch { /* dispose 清理失败不阻塞重建 */ }
-      }
-      ctx.registry.delete(oldPlugin)
-      const newFibers: any[] = []
-      for (const oldFiber of fibers) {
-        try {
-          const fiber = oldFiber.parent.registry.plugin(fresh, config, () => [])
-          fiber.entry = oldFiber.entry
-          if (fiber.entry) fiber.entry.fiber = fiber
-          newFibers.push(fiber)
-          rebuilt++
-        } catch (e) {
-          failures.push(String(e))
-        }
-      }
-      // ⚠️ 等新 fiber 完成初始化（loading → active）：registry.plugin 同步返回的
-      // fiber 还是 pending/loading——若不等，随后的 client 操作（processOne 的
-      // !entry.disabled 检查、activeEntry 查找）会基于不稳定状态失败（实测
-      // reload 报 client ✗ 的根因：activeEntry=none → fullName 回落短名 →
-      // processOne 精确匹配失败；reload 返回后 fiber 才转 active 补注册）。
-      await Promise.allSettled(newFibers.map((f) => {
-        const p = typeof f.await === 'function' ? f.await() : undefined
-        return p ?? Promise.resolve()
-      }))
-    } catch (e) {
-      // 整体失败：回滚缓存 + 用旧插件重建
-      for (const [u, job] of backup) loadCache.set(u, job)
+    // ⚠️ 整段交换走 handoff：dispose 旧 fiber 与「等新 fiber 转 active」都是
+    // 等别的 fiber 生命周期，在工具调用栈里无界等会成环（案底 2026-09-07：
+    // reload 挂死宿主、只能重启）。到 HANDOFF_MS 即转后台继续，同一操作不重复触发。
+    return handoff('reload', match, HANDOFF_MS, async () => {
+      const failures: string[] = []
+      let rebuilt = 0
       try {
-        ctx.registry.delete(fresh)
-        for (const oldFiber of fibers) {
-          const fiber = oldFiber.parent.registry.plugin(oldPlugin, currentConfigOf(oldFiber._config), () => [])
-          fiber.entry = oldFiber.entry
-          if (fiber.entry) fiber.entry.fiber = fiber
+        const config = currentConfigOf(fibers[0]?._config)
+        // ⚠️ 竞态修复：cordis 的 fiber.dispose() 是异步清理（_unload await disposables，
+        // 含 context/tools 注册注销）——必须先 await 旧 fiber 完全 dispose，
+        // 再建新 fiber，否则新 fiber apply 时旧注册残留 → duplicate（此前热
+        // 重载连环 "already registered" 的根因）。registry.delete 是 fire-and-forget，
+        // 所以这里直接 await entry.fiber 的 dispose（返回 disposalTask Promise）。
+        const entryForDispose = [...ctx.loader.entries()].find((en) => {
+          const o = en.options as { name?: string }
+          return o?.name && String(o.name).includes(match)
+        })
+        const oldFiberEntry = entryForDispose?.fiber
+        if (oldFiberEntry && typeof oldFiberEntry.dispose === 'function') {
+          try {
+            await oldFiberEntry.dispose()
+          } catch { /* dispose 清理失败不阻塞重建 */ }
         }
-      } catch { /* 尽力而为 */ }
-      const message = String(e instanceof Error ? (e.stack ?? e.message) : e)
-      // 强制登记守卫：duplicate route = 旧 fiber 存在「未登记到 ctx.effect 的裸注册」，
-      // dispose 无法自动注销 → 新注册撞车。检测到即报错要求登记，并自动清理残留自愈。
-      if (message.includes('duplicate') || message.includes('already registered')) {
-        const cleaned = clearRoutesByMatch(match)
-        return 'ERROR: 检测到未登记的裸注册（' + (e instanceof Error ? e.message : String(e))
-          + '）——插件必须把资源注册挂到 ctx.effect（登记后 dispose 自动清理，热重载不再残留）。'
-          + '\n已自动清理疑似残留路由：' + (cleaned.length ? cleaned.join(', ') : '（无）')
-          + '\n请重载重试；若仍失败请检查插件源码中的裸注册。'
+        ctx.registry.delete(oldPlugin)
+        const newFibers: any[] = []
+        for (const oldFiber of fibers) {
+          try {
+            const fiber = oldFiber.parent.registry.plugin(fresh, config, () => [])
+            fiber.entry = oldFiber.entry
+            if (fiber.entry) fiber.entry.fiber = fiber
+            newFibers.push(fiber)
+            rebuilt++
+          } catch (e) {
+            failures.push(String(e))
+          }
+        }
+        // ⚠️ 等新 fiber 完成初始化（loading → active）：registry.plugin 同步返回的
+        // fiber 还是 pending/loading——若不等，随后的 client 操作（processOne 的
+        // !entry.disabled 检查、activeEntry 查找）会基于不稳定状态失败（实测
+        // reload 报 client ✗ 的根因：activeEntry=none → fullName 回落短名 →
+        // processOne 精确匹配失败；reload 返回后 fiber 才转 active 补注册）。
+        await Promise.allSettled(newFibers.map((f) => {
+          const p = typeof f.await === 'function' ? f.await() : undefined
+          return p ?? Promise.resolve()
+        }))
+      } catch (e) {
+        // 整体失败：回滚缓存 + 用旧插件重建
+        for (const [u, job] of backup) loadCache.set(u, job)
+        try {
+          ctx.registry.delete(fresh)
+          for (const oldFiber of fibers) {
+            const fiber = oldFiber.parent.registry.plugin(oldPlugin, currentConfigOf(oldFiber._config), () => [])
+            fiber.entry = oldFiber.entry
+            if (fiber.entry) fiber.entry.fiber = fiber
+          }
+        } catch { /* 尽力而为 */ }
+        const message = String(e instanceof Error ? (e.stack ?? e.message) : e)
+        recordOp('reload', false)
+        // 强制登记守卫：duplicate route = 旧 fiber 存在「未登记到 ctx.effect 的裸注册」，
+        // dispose 无法自动注销 → 新注册撞车。检测到即报错要求登记，并自动清理残留自愈。
+        if (message.includes('duplicate') || message.includes('already registered')) {
+          const cleaned = clearRoutesByMatch(match)
+          return 'ERROR: 检测到未登记的裸注册（' + (e instanceof Error ? e.message : String(e))
+            + '）——插件必须把资源注册挂到 ctx.effect（登记后 dispose 自动清理，热重载不再残留）。'
+            + '\n已自动清理疑似残留路由：' + (cleaned.length ? cleaned.join(', ') : '（无）')
+            + '\n请重载重试；若仍失败请检查插件源码中的裸注册。'
+        }
+        return 'ERROR: 重建失败，已回滚（旧代保留）: ' + message
       }
-      return 'ERROR: 重建失败，已回滚（旧代保留）: ' + message
-    }
 
-    if (failures.length) {
-      return `WARN: ${match} 部分重建（${rebuilt}/${fibers.length}）: ${failures.join('; ')}`
-    }
-    // 清 disabled（幽灵 entry 隔离）：热重载后 client 模块可重新注册（UI 生效）
-    normalizeEntriesByName(match)
-    // ⚠️ 以下 client 操作必须用**完整包名**：client-modules 的 processOne 对
-    // entry.options.name 做精确匹配（短名 ≠ '@dsh-external/...' 完整包名），
-    // 传短名会静默注册失败（实测 reload 报 client ✗ 的根因——microtask flush
-    // 后来用完整名补注册，但返回信息已经错了）。
-    const activeEntry = [...ctx.loader.entries()].find((en) => {
-      const o = en.options
-      return !o.group && String(o.name).includes(match) && en.fiber && FIBER_NAMES[en.fiber.state] === 'active'
-    })
-    const fullName = activeEntry?.options.name ?? match
-    // ═══ 临时诊断（排查 reload 后 client ✗）：写 reload-debug.log ═══
-    try {
-      const dbg = [
-        `[${new Date().toISOString()}] reload match=${match} fullName=${fullName}`,
-        `  activeEntry=${activeEntry ? activeEntry.id : 'none'} fiberState=${activeEntry?.fiber ? FIBER_NAMES[activeEntry.fiber.state] : '?'} entry.disabled=${activeEntry ? activeEntry.disabled : '?'} options.disabled=${activeEntry ? JSON.stringify(activeEntry.options.disabled) : '?'}`,
-      ]
-      const cmDbg = ctx.get('clientModules') as { clientPath?: (id: string) => string | undefined; table?: Map<string, unknown> } | undefined
-      dbg.push(`  cm=${cmDbg ? 'yes' : 'no'} clientPath(short)=${cmDbg?.clientPath ? String(cmDbg.clientPath(match)) : '?'} clientPath(full)=${cmDbg?.clientPath ? String(cmDbg.clientPath(fullName)) : '?'}`)
-      if (cmDbg?.table) {
-        const keys: string[] = []
-        for (const k of cmDbg.table.keys()) keys.push(String(k))
-        dbg.push(`  table keys(${keys.length}): ${keys.filter((k) => k.includes('dsh-external')).join(',') || '(none)'}`)
+      if (failures.length) {
+        recordOp('reload', rebuilt > 0)
+        return `WARN: ${match} 部分重建（${rebuilt}/${fibers.length}）: ${failures.join('; ')}`
       }
-      appendFileSync(join(dshHome, 'super-injector', 'reload-debug.log'), dbg.join('\n') + '\n')
-    } catch { /* 诊断失败不阻塞 */ }
-    // client 模块补扫（表丢失/从未注册时自愈——web 重启后幽灵 entry 场景）
-    refreshClientRow(fullName)
-    // client bundle 联动：host 重载后 bundle rev 变化通知浏览器（改 UI → 免手动刷新）
-    notifyClientRebuilt(fullName)
-    // 自检：完整包名查表（表 key 是完整包名，完全匹配）
-    const client = clientStatus(fullName)
-    recordOp('reload', rebuilt > 0)
-    return `OK: ${match} 热重载完成（清缓存 ${urls.length} 模块，重建 ${rebuilt} fiber）\n- ${client}`
+      // 清 disabled（幽灵 entry 隔离）：热重载后 client 模块可重新注册（UI 生效）
+      normalizeEntriesByName(match)
+      // ⚠️ 以下 client 操作必须用**完整包名**：client-modules 的 processOne 对
+      // entry.options.name 做精确匹配（短名 ≠ '@dsh-external/...' 完整包名），
+      // 传短名会静默注册失败（实测 reload 报 client ✗ 的根因——microtask flush
+      // 后来用完整名补注册，但返回信息已经错了）。
+      const activeEntry = [...ctx.loader.entries()].find((en) => {
+        const o = en.options
+        return !o.group && String(o.name).includes(match) && en.fiber && FIBER_NAMES[en.fiber.state] === 'active'
+      })
+      const fullName = activeEntry?.options.name ?? match
+      // ═══ 临时诊断（排查 reload 后 client ✗）：写 reload-debug.log ═══
+      try {
+        const dbg = [
+          `[${new Date().toISOString()}] reload match=${match} fullName=${fullName}`,
+          `  activeEntry=${activeEntry ? activeEntry.id : 'none'} fiberState=${activeEntry?.fiber ? FIBER_NAMES[activeEntry.fiber.state] : '?'} entry.disabled=${activeEntry ? activeEntry.disabled : '?'} options.disabled=${activeEntry ? JSON.stringify(activeEntry.options.disabled) : '?'}`,
+        ]
+        const cmDbg = ctx.get('clientModules') as { clientPath?: (id: string) => string | undefined; table?: Map<string, unknown> } | undefined
+        dbg.push(`  cm=${cmDbg ? 'yes' : 'no'} clientPath(short)=${cmDbg?.clientPath ? String(cmDbg.clientPath(match)) : '?'} clientPath(full)=${cmDbg?.clientPath ? String(cmDbg.clientPath(fullName)) : '?'}`)
+        if (cmDbg?.table) {
+          const keys: string[] = []
+          for (const k of cmDbg.table.keys()) keys.push(String(k))
+          dbg.push(`  table keys(${keys.length}): ${keys.filter((k) => k.includes('dsh-external')).join(',') || '(none)'}`)
+        }
+        appendFileSync(join(dshHome, 'super-injector', 'reload-debug.log'), dbg.join('\n') + '\n')
+      } catch { /* 诊断失败不阻塞 */ }
+      // client 模块补扫（表丢失/从未注册时自愈——web 重启后幽灵 entry 场景）
+      refreshClientRow(fullName)
+      // client bundle 联动：host 重载后 bundle rev 变化通知浏览器（改 UI → 免手动刷新）
+      notifyClientRebuilt(fullName)
+      // 自检：完整包名查表（表 key 是完整包名，完全匹配）
+      const client = clientStatus(fullName)
+      recordOp('reload', rebuilt > 0)
+      return `OK: ${match} 热重载完成（清缓存 ${urls.length} 模块，重建 ${rebuilt} fiber）\n- ${client}`
+    })
   }
 
   // ============ 插件状态 ============
@@ -1381,7 +1492,13 @@ export function apply(ctx: AppContext, config: Config): void {
       const injected = injectedNames.has(opts.name) ? ' [injected]' : ''
       lines.push(`- [${state}] ${opts.id} (${opts.name})${injected}${opts.disabled ? ' [disabled]' : ''}${entryUrl ? '\n    entry: ' + entryUrl : ''}`)
     }
-    return lines.length ? lines.join('\n') : '（loader 中无已装配插件 entry）'
+    let out = lines.length ? lines.join('\n') : '（loader 中无已装配插件 entry）'
+    // 后台收口公示：handoff 把「等不到就转后台」的操作记在这里——异步化不丢可观测性
+    if (bgOps.size) {
+      out += '\n===== 后台操作（有界交接转后台）=====\n'
+        + [...bgOps.entries()].map(([k, v]) => `- ${k} [${v.state}] ${v.kind} @${new Date(v.at).toISOString()} :: ${v.detail}`).join('\n')
+    }
+    return out
   }
 
   /** 查找匹配的 entry（id 或 name 子串）——优先活跃 entry，跳过 disposed/failed/disabled 残留。 */
@@ -1530,10 +1647,31 @@ export function apply(ctx: AppContext, config: Config): void {
     async execute(a: any) {
       const t = staged.get(a.name)
       if (!t) return `ERROR: staging 无此工具（${a.name}）——dev_stage_list 查看`
+      // ⚠️ 异步逃逸兜底（2026-09-12 崩溃循环案底）：下面这层 try/catch 只接得住
+      // **同步抛出**与**被 await 的 rejection**。漏出去的是后侧工具里**未被 await 的
+      // promise rejection** —— Node 默认行为是直接杀进程，表现为宿主
+      // `dsh: fatal load failure` 退出 code=1，而桌面壳会无条件重启 → 崩溃循环，
+      // 用户只看到「反反复复重启」。实测栈：SessionQueryError（本部署 session-query
+      // 配置成 openAt:"never"，搜索被禁用）从 staged 工具的执行路径逃出。
+      //
+      // ★★ **注意：这【不是】安全网**（安全网是上面那段【常驻】兜底）——
+      //   本监听**只负责"把逃逸告诉调用者"**（把栈回执进工具输出，便于当场定位）。
+      //   ⚠️ 曾误以为"只挂调用窗口就够" ⇒ **被负对照打红**：`unhandledRejection` 在微任务
+      //      队列**排空之后**才上报，`finally` 摘监听时它还没上报 ⇒ **窗口一关等于没挂**。
+      //      ⇒ 所以安全网必须是【常驻】的；本处保留是为了**回执**，不是为了让进程不退出。
+      //   只兜 rejection，不兜 uncaughtException —— 后者接住会让进程带伤继续跑，风险更大。
+      const escaped: unknown[] = []
+      const onRej = (r: unknown): void => { escaped.push(r instanceof Error ? (r.stack ?? r.message) : String(r)) }
+      process.on('unhandledRejection', onRej)
       try {
-        return String(await t.execute(a.args ?? {}, ctx))
+        const out = String(await t.execute(a.args ?? {}, ctx))
+        return escaped.length
+          ? out + `\n⚠ 后侧工具「${a.name}」逃逸了未被 await 的 rejection（已降级，宿主未受影响）：\n` + escaped.join('\n') + '\n修法：在该工具里 await 所有异步调用。'
+          : out
       } catch (e) {
         return 'ERROR: ' + (e instanceof Error ? (e.stack ?? e.message) : String(e))
+      } finally {
+        process.off('unhandledRejection', onRej)
       }
     },
   }))
@@ -2078,35 +2216,62 @@ export function apply(ctx: AppContext, config: Config): void {
    * 返回问题列表（空 = 健康）。lib 与 src 双检查（只有 lib 无 src 不绕过）。
    * ⚠️ slot 白名单（2026-08-14 dsh-external-plugins 事件教训）：注册的 slot 名
    * 必须位于已知合法集合内——早期只认 conversation.view，导致 settings.plugin.item
-   * 等设置页卡片被误判为坏骨架；同时白名单外的陌生 slot 名仍视为异常，防 typo。 */
-  const KNOWN_SLOTS = ['conversation.view', 'settings.plugin.item', 'settings.plugins.tab', 'settings.section', 'settings.general.item', 'conversation.session.header.actions', 'conversation.session.header.utilities', 'conversation.input.dock', 'conversation.composer.dock', 'sidebar.footer.action', 'shell.overlay']
+   * 等设置页卡片被误判为坏骨架；同时白名单外的陌生 slot 名仍视为异常，防 typo。
+   * 名单来源（2026-09-10 从官方 dsh-client-* 的 client.js 抽取的全集）：早期硬编码 11 项
+   * 漏掉右侧栏/主壳/会话头那一大批，照样误判——**名单必须跟着官方 client 包更新**。 */
+  const KNOWN_SLOTS = ['main', 'main.conversation', 'root', 'sidebar', 'sidebar.brand.mark', 'sidebar.brand.name', 'sidebar.settings', 'sidebar.workspaces', 'sidebar.workspaces.directoryFlow', 'sidebar.footer.action', 'sidebar.right.pane.tab', 'sidebar.right.pane.tab.title', 'sidebar.right.tab.document', 'rightbar', 'rightbar.session', 'conversation.view', 'conversation.session', 'conversation.session.header', 'conversation.session.header.actions', 'conversation.session.header.corner', 'conversation.session.header.lineage', 'conversation.session.header.utilities', 'conversation.composer', 'conversation.composer.bar', 'conversation.composer.dock', 'conversation.input.dock', 'conversation.input.model', 'conversation.input.overlay', 'conversation.input.plan', 'conversation.input.attachments', 'conversation.chat.node', 'conversation.chat.assistant-actions', 'conversation.chat.turnTail', 'conversation.hero.agentPreset', 'conversation.hero.workspace', 'conversation.hero.workspace.directoryFlow', 'conversation.message.images', 'conversation.trajectory.images', 'conversation.approval.detail', 'settings.trigger', 'settings.header', 'settings.close', 'settings.section', 'settings.action', 'settings.general.item', 'settings.plugin.item', 'settings.plugins.tab', 'settings.onboarding', 'tool.call.images', 'tool.call.toolview', 'shell.overlay']
   const SLOT_ALT = KNOWN_SLOTS.map((s) => s.replace(/\./g, '\\.')).join('|')
-  const REGISTER_NAME = new RegExp(`register\\(\\{[\\s\\S]*?name:\\s*['"](${SLOT_ALT})['"]`)
+  // v42 修正（2026-09-10）：官方右侧栏的注册是**两步式**——先
+  // `ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name, key }, Body))`，
+  // 于是 `register({` 与 `name:` 之间有 `inject(...)` 的回调头，旧正则要求两者紧邻会误判
+  // 合法插件为坏骨架（实测：dsh-agent-browser 被阻断注入）。改成在 register({...}) 的
+  // 花括号段内任意位置找 name，既不放过 typo，也不再要求书写顺序。
+  // ⚠️ **`{0,400}` 这个上限的作用**：`[\s\S]*?` 是**惰性**的 ⇒ 若某个 `register({` 的对象里
+  //    根本没有 `name:`，它会**一路越过 `}` 继续找后面任意位置的 `name:`** ⇒ 于是"漏写 name
+  //    的 typo"会被误判成合法 ⇒ **上限是为了不跨到下一个 register/别的对象**。
+  //   ⚠️ **但它是【紧的】**：实测合法注册里，`register({` 到 `name:` 的距离跨度 **11 ~ 609 字符**
+  //      （`dsh-agent-browser` 与 `dsh-org-panel` 各有一处 **452 / 609**）
+  //      ⇒ 若某插件**只有一处** slot 注册、且对象头很长 ⇒ **400 会把它误判成坏骨架**。
+  //      （当前那几例不触发：它们另有近距离注册，而本检查是 `.test()`（任一命中即可）。）
+  //   ⇒ ★ **标注：阈值 400 的来历我未核**（它不是我定的）—— 记在此处，供 owner 复看。
+  const REGISTER_NAME = new RegExp(`register\\(\\{[\\s\\S]{0,400}?name:\\s*['"](${SLOT_ALT})['"]`)
 
   function clientSkeletonProblems(base: string): string[] {
     const problems: string[] = []
+    // v41 修正：**不是每个 client 入口都要注册 slot**。两种合法例外实测被误判为坏骨架
+    // （17 次启动都被跳过恢复，最早 2026-09-08 10:34Z）：
+    //   ① 空占位 client（dsh-engram-relay：图谱 Tab 已移除，只留 ctx.effect 占位）
+    //   ② 走别的服务挂 UI（dsh-browser-panel：betterSidebar.registerTab / 直接挂 DOM，
+    //      且刻意不声明硬 inject——sessions 是可选获取的）
+    // 原检查假定「client = 一定注册 slot」，于是要求 inject 含 slots + register 带合法 name。
+    // 现在只在**代码真的引用 slots** 时才要求这两项——「想注册却忘了声明 inject」照样抓得住。
+    const usesSlots = (text: string): boolean => /ctx\.slots|slots\.register/.test(text)
     try {
       // 1. 编译产物（实际运行文件）——lib/client.js（CJS bundle）
       // ⚠️ 正则兼容单双引号（实测：用户手修用 "slots" 双引号——只认单引号会误判健康插件）
       const libClient = join(base, 'lib', 'client.js')
       if (existsSync(libClient)) {
         const lib = readFileSync(libClient, 'utf8')
-        if (!/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
-          problems.push('lib/client.js 缺 inject 含 slots（apply 用 ctx.slots 必须声明——cordis 服务注入契约）')
-        }
-        if (!REGISTER_NAME.test(lib)) {
-          problems.push(`lib/client.js 的 register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}）`)
+        if (usesSlots(lib)) {
+          if (!/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
+            problems.push('lib/client.js 用了 ctx.slots 却缺 inject 含 slots（cordis 服务注入契约）')
+          }
+          if (!REGISTER_NAME.test(lib)) {
+            problems.push(`lib/client.js 的 register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}）`)
+          }
         }
       }
       // 2. 源码骨架（有 src 时）
       const clientSrcPath = join(base, 'src', 'client', 'index.ts')
       if (existsSync(clientSrcPath)) {
         const src = readFileSync(clientSrcPath, 'utf8')
-        if (!/export const inject\s*=\s*\[[^\]]*['"]slots['"]/.test(src)) {
-          problems.push("src/client/index.ts 缺 export const inject = ['slots']（apply 用 ctx.slots 必须声明，否则报 cannot get property 'slots' without inject）")
-        }
-        if (!REGISTER_NAME.test(src)) {
-          problems.push(`slots.register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}——缺了报 slot undefined is not declared）`)
+        if (usesSlots(src)) {
+          if (!/export const inject\s*=\s*\[[^\]]*['"]slots['"]/.test(src)) {
+            problems.push("src/client/index.ts 用了 ctx.slots 却缺 export const inject = ['slots']（否则报 cannot get property 'slots' without inject）")
+          }
+          if (!REGISTER_NAME.test(src)) {
+            problems.push(`slots.register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}——缺了报 slot undefined is not declared）`)
+          }
         }
       }
     } catch { /* 读不到文件时跳过 */ }
@@ -2253,6 +2418,22 @@ export function apply(ctx: AppContext, config: Config): void {
     return healed
   }
 
+  /**
+   * 读 profile `package.json` 的 `dsh.profile.bundles` 列表（**只读，失败 ⇒ 空数组**）。
+   * ★ 用途：**bundles 防重护栏**（见 `restore()` ②）—— 判断"这个包是不是已经由 bundles 装配"。
+   * ⚠️ 路径写死 `profiles/web`：与 `profileNodeModules` 的缺省形态一致（那里也写死 web）。
+   */
+  function readProfileBundles(): string[] {
+    try {
+      const pkgPath = join(dshHome, 'profiles', 'web', 'package.json')
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
+      const list = pkg?.dsh?.profile?.bundles
+      return Array.isArray(list) ? list.filter((x: unknown) => typeof x === 'string') : []
+    } catch {
+      return []
+    }
+  }
+
   async function restore(): Promise<void> {    // ① profile link 依赖 junction 自愈（断电/强制关机后 junction 悬空 → 重建；
     //    覆盖 bundles 装配依赖 + agent preset 解析依赖，见 healProfileLinks）。
     try {
@@ -2261,8 +2442,19 @@ export function apply(ctx: AppContext, config: Config): void {
       logger.warn('[super-injector] junction 自愈扫描失败: %s', String(err))
     }
     // ② 注入清单恢复（原逻辑）
+    // ⚠️ bundles 防重护栏（2026-09-08 closedloop 双装配事故）：包已列进 profile
+    // package.json 的 dsh.profile.bundles 时，重启后由 bundles 正常装配——此处再
+    // 恢复会造第二实例（boot 早期 bundle entry 尚未 active，hasActiveEntry 拦不住），
+    // 命中 duplicate namespace/route 直接炸整棵 plugin tree。dev_install_package 后
+    // registry 若残留旧 dev_inject 条目即触发；跳过 + 审计，不删条目（保留观感）。
+    const bundlesOwned = new Set(readProfileBundles())
     for (const e of readRegistry()) {
       try {
+        if (bundlesOwned.has(e.name)) {
+          auditLog('restore-skip-bundles-owned', `${e.name} 已由 profile bundles 装配，跳过 registry 恢复（防双实例）`)
+          logger.info('[super-injector] %s 由 bundles 装配，跳过 registry 恢复（防双实例）', e.name)
+          continue
+        }
         if (hasActiveEntry(e.name)) continue
         // ⚠️ 恢复前 client 骨架校验（pixel-forge 事件教训：坏 client 插件
         // 恢复 → apply 失败 → 整个 HARNESS 启动失败——用户被迫手动修）。
@@ -2425,7 +2617,9 @@ export function apply(ctx: AppContext, config: Config): void {
         auditLog('inject-stale-artifacts', `${dir}: ${fresh.warn.join('; ')}`)
         logger.warn('[super-injector] 注入 %s 构建产物可能过期（未阻断）: %s', dir, fresh.warn.join('; '))
       }
-      return withOpLock(() => inject(dir))
+      // 同上（2026-09-12）：工具边界统一有界交接——注入同样要 await 别的 fiber 生命周期。
+      // ⚠️ 嵌套顺序有意义：**handoff 在外（先设边界）· withOpLock 在内（再拿操作锁）**。
+      return handoff('inject', dir, HANDOFF_MS, () => withOpLock(() => inject(dir)))
     },
   }))
 
@@ -2459,7 +2653,8 @@ export function apply(ctx: AppContext, config: Config): void {
     async execute(args: { match: string; self?: boolean }) {
       const match = String(args?.match ?? '').trim()
       if (!match) return 'ERROR: match 必填（包名/路径子串）'
-      return withOpLock(() => uninject(match, Boolean(args.self)))
+      // 同上（2026-09-12）：卸载要 dispose fiber，是同一类无界等待。
+      return handoff('uninject', match, HANDOFF_MS, () => withOpLock(() => uninject(match, Boolean(args.self))))
     },
   }))
 
@@ -2495,7 +2690,7 @@ export function apply(ctx: AppContext, config: Config): void {
 
   safeRegister(defineTool({
     name: 'dev_reload_package',
-    description: '确定性热重载已加载的 bundle 插件包（清缓存 → 重新 import → registry 重建 fiber，失败回滚保留旧代）。不带参数时返回当下已装配插件清单；带参数重载并给出重载前后 fiber 状态对比。',
+    description: '热重载已加载的 bundle 插件包（清缓存 → 重新 import → 释放旧 fiber → registry 重建 fiber，失败回滚保留旧代）。不带参数 = 只列已装配清单（含「后台操作」收口结果）；带 packageName = 重载并给出前后 fiber 状态。安全网（案底 2026-09-07：工具栈内 await dispose 与工具调度器成环，挂死宿主需重启）：交换最多在内联等 6s，到点即转后台继续同一操作（不重复触发），回执为 WARN +「已转后台」——此时用本工具不带参数看「后台操作」确认 done/failed，长期 running 才需重启宿主。',
     parameters: {
       packageName: { type: 'string', description: '包路径子串（缺省 = 只列插件清单，不重载）' },
     },
@@ -2509,14 +2704,24 @@ export function apply(ctx: AppContext, config: Config): void {
       }
       const entry = findEntry(args.packageName)
       const before = entry ? stateOf(entry) : '（未找到）'
-      const result = await withOpLock(() => reloadPackage(args.packageName!))
+      // ⚠️ 外层有界交接（2026-09-12 二次吊死案底）：内层 handoff 只盖住「dispose 旧 fiber →
+      // 重建 fiber」那一段，而 import / 取锁 / findEntry 全在网外。任一处无界等，整个工具
+      // 调用就永不返回——宿主活着，会话被自己的 reload 吊死（实测证据：16:07:31Z 那次
+      // 连一行 reload-debug 都没写，说明卡点在网外的 import 或取锁，而非内层 dispose）。
+      // 纪律升级：**工具边界**是最终兜底网，任何内层超时都只是提前量。
+      // ⚠️ 嵌套顺序有意义：**handoff 在外（先设边界）· withOpLock 在内（再拿操作锁）**。
+      const result = await handoff('reload', args.packageName!, HANDOFF_MS, () => withOpLock(() => reloadPackage(args.packageName!)))
       // ⚠️ 误报修复（2026-08 实测 "disposed（超时未稳定）" 假象）：重载后
       // loader 可能替换/重建 entry 对象——**旧 entry 引用指向已 dispose 的
       // 旧 fiber**，waitFiberStable 轮询 3 秒都读旧状态 → 误报。必须重新
       // findEntry 拿最新 entry 再查（新 fiber 已挂 entry.fiber，await 已完成）。
       const freshEntry = findEntry(args.packageName)
       const after = freshEntry ? await waitFiberStable(freshEntry) : '（未找到）'
-      return result + '\n--- 重载前后状态 ---\nbefore: [' + before + ']\nafter: [' + after + ']'
+      const bg = bgOps.get(args.packageName!)
+      const bgLine = bg && String(result).startsWith('WARN')
+        ? `\n- 后台操作：[${bg.state}] ${bg.detail}`
+        : ''
+      return result + bgLine + '\n--- 重载前后状态 ---\nbefore: [' + before + ']\nafter: [' + after + ']'
     },
   }))
 
