@@ -21,12 +21,12 @@
  *  - 官方 HMR 对 bundle 插件不生效（node_modules 排除 + root:[]），本插件补上。
  */
 
-import { Context } from 'cordis'
+import { Context } from '@deepseek-ai/cordis'
 import type Loader from '@deepseek-ai/cordis-plugin-loader'
 import type SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import z from 'schemastery'
+import z from '@deepseek-ai/schemastery'
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync } from 'node:fs'
 import { join, relative, dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
@@ -87,9 +87,9 @@ link_pkg() {
 echo "=== Linking build dependencies (checkout: $CHECKOUT) ==="
 mkdir -p node_modules/@deepseek-ai
 node -e "const fs=require('fs');fs.rmSync('node_modules/@standard-schema',{recursive:true,force:true})"
-link_pkg cordis vendor/cordis
+link_pkg @deepseek-ai/cordis vendor/cordis
 link_pkg cosmokit vendor/cosmokit
-link_pkg schemastery vendor/schemastery
+link_pkg @deepseek-ai/schemastery vendor/schemastery
 link_pkg @deepseek-ai/dsh-tools packages/core/tools
 link_pkg @deepseek-ai/dsh-llm packages/llm/llm
 link_pkg @deepseek-ai/dsh-system-prompt packages/core/system-prompt
@@ -153,9 +153,9 @@ function scaffoldToolkitSrc(pkgName: string, description: string): string {
  *    首轮请求结构决定整条会话的策略轨迹，锚定在训练对齐的窄工具面再放开，能力不损。
  *    启用方法见 apply() 末尾的注释块。
  */
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import z from 'schemastery'
+import z from '@deepseek-ai/schemastery'
 
 export const name = ${JSON.stringify(pkgName)}
 export const inject = ['tools']
@@ -210,13 +210,13 @@ function scaffoldDaemonSrc(pkgName: string, description: string): string {
  * 小 agent loop：timer 驱动自主循环 → 观察 → LLM 决策 → 行动 → 再睡。
  * 插件自身的提示词/循环参数皆可自我优化（改 → build → dev_reload_package）。
  */
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import type LlmService from '@deepseek-ai/dsh-llm'
 import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
-import z from 'schemastery'
+import z from '@deepseek-ai/schemastery'
 
 type AppContext = Context & {
   llm: LlmService
@@ -317,9 +317,9 @@ function scaffoldUiSrc(pkgName: string, description: string): string {
  * host 侧：工具 + webServer API；client 侧：conversation.view slot 面板。
  * 构建：npm run build（host tsc）+ npm run build:client（tsdown → lib/client.js）。
  */
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import z from 'schemastery'
+import z from '@deepseek-ai/schemastery'
 
 export const name = ${JSON.stringify(pkgName)}
 export const inject = ['tools', 'webServer']
@@ -403,7 +403,7 @@ const PLUGIN_ID = ${JSON.stringify(pkgName)}
 
 const CLIENT_EXTERNALS = [
   'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client',
-  'cordis',
+  '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-client-ui-slots',
   '@deepseek-ai/dsh-client-runtime/client',
 ]
@@ -441,8 +441,8 @@ function scaffoldPackageJson(pkgName: string, description: string, form: string)
   const peerDeps: Record<string, string> = {
     '@deepseek-ai/dsh-llm': '>=0.0.1-rc <2',
     '@deepseek-ai/dsh-tools': '>=0.0.1-rc <2',
-    'cordis': '>=4.0.0-rc <5',
-    'schemastery': '^3.18.0',
+    '@deepseek-ai/cordis': '>=4.0.0-rc <5',
+    '@deepseek-ai/schemastery': '^3.18.2',
   }
   if (withClient) {
     peerDeps['@deepseek-ai/dsh-client-ui-slots'] = '>=0.0.1-rc <2'
@@ -3242,13 +3242,13 @@ export function apply(ctx: AppContext, config: Config): void {
         writeFileSync(join(tmpDir, 'package.json'), JSON.stringify({
           name: TEST_PKG, version: '0.0.1', private: true, type: 'module',
           main: './lib/index.js', files: ['lib'], license: 'BSD-3-Clause',
-          peerDependencies: { '@deepseek-ai/dsh-tools': '>=0.0.1-rc <2', 'cordis': '>=4.0.0-rc <5' },
+          peerDependencies: { '@deepseek-ai/dsh-tools': '>=0.0.1-rc <2', '@deepseek-ai/cordis': '>=4.0.0-rc <5' },
           devDependencies: { '@types/node': '^24.13.3', typescript: '^5.9.0' },
           scripts: { build: 'bash scripts/build.sh' },
         }, null, 2) + '\n', 'utf8')
         writeFileSync(join(tmpDir, 'tsconfig.json'), '{\n  "compilerOptions": {\n    "target": "ES2023", "module": "NodeNext", "moduleResolution": "NodeNext", "lib": ["ES2023"],\n    "strict": true, "types": ["node"], "declaration": true, "declarationDir": "lib/types",\n    "outDir": "lib", "rootDir": "src", "skipLibCheck": true, "esModuleInterop": true,\n    "sourceMap": true\n  },\n  "include": ["src"]\n}\n', 'utf8')
-        writeFileSync(join(tmpDir, 'src', 'index.ts'), `import type { Context } from 'cordis'\nimport { defineTool } from '@deepseek-ai/dsh-tools'\nexport const name = ${JSON.stringify(TEST_PKG)}\nexport const inject = ['tools']\nexport function apply(ctx: Context): void {\n  ctx.effect(() => ctx.tools.register(defineTool({\n    name: 'self_test_hello',\n    description: 'self test',\n    parameters: {},\n    output: { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },\n    async execute() { return 'hello' },\n  })), 'self-test')\n}\n`, 'utf8')
-        writeFileSync(join(tmpDir, 'scripts', 'build.sh'), `#!/bin/bash\nset -euo pipefail\nROOT="$(cd "$(dirname "$0")/.." && pwd)"\ncd "$ROOT"\nCHECKOUT="\${DSH_CHECKOUT:-}"\nif [ -z "$CHECKOUT" ] || [ ! -d "$CHECKOUT/packages" ]; then echo "no checkout" >&2; exit 1; fi\nTSC="$CHECKOUT/node_modules/.bin/tsc"\nlink_pkg() {\n  node -e "const fs=require('fs');const path=require('path');const l=path.resolve(process.argv[1]);const t=path.resolve(process.argv[2]);fs.rmSync(l,{recursive:true,force:true});fs.mkdirSync(path.dirname(l),{recursive:true});fs.symlinkSync(t,l,process.platform==='win32'?'junction':'dir');" "node_modules/$1" "$2"\n}\nmkdir -p node_modules/@deepseek-ai\nnode -e "const fs=require('fs');fs.rmSync('node_modules/@standard-schema',{recursive:true,force:true})"\nlink_pkg cordis "$CHECKOUT/vendor/cordis"\nlink_pkg cosmokit "$CHECKOUT/vendor/cosmokit"\nlink_pkg schemastery "$CHECKOUT/vendor/schemastery"\nlink_pkg @deepseek-ai/dsh-tools "$CHECKOUT/packages/core/tools"\nlink_pkg @types/node "$CHECKOUT/node_modules/@types/node"\n"$TSC" -p tsconfig.json\n`, 'utf8')
+        writeFileSync(join(tmpDir, 'src', 'index.ts'), `import type { Context } from '@deepseek-ai/cordis'\nimport { defineTool } from '@deepseek-ai/dsh-tools'\nexport const name = ${JSON.stringify(TEST_PKG)}\nexport const inject = ['tools']\nexport function apply(ctx: Context): void {\n  ctx.effect(() => ctx.tools.register(defineTool({\n    name: 'self_test_hello',\n    description: 'self test',\n    parameters: {},\n    output: { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },\n    async execute() { return 'hello' },\n  })), 'self-test')\n}\n`, 'utf8')
+        writeFileSync(join(tmpDir, 'scripts', 'build.sh'), `#!/bin/bash\nset -euo pipefail\nROOT="$(cd "$(dirname "$0")/.." && pwd)"\ncd "$ROOT"\nCHECKOUT="\${DSH_CHECKOUT:-}"\nif [ -z "$CHECKOUT" ] || [ ! -d "$CHECKOUT/packages" ]; then echo "no checkout" >&2; exit 1; fi\nTSC="$CHECKOUT/node_modules/.bin/tsc"\nlink_pkg() {\n  node -e "const fs=require('fs');const path=require('path');const l=path.resolve(process.argv[1]);const t=path.resolve(process.argv[2]);fs.rmSync(l,{recursive:true,force:true});fs.mkdirSync(path.dirname(l),{recursive:true});fs.symlinkSync(t,l,process.platform==='win32'?'junction':'dir');" "node_modules/$1" "$2"\n}\nmkdir -p node_modules/@deepseek-ai\nnode -e "const fs=require('fs');fs.rmSync('node_modules/@standard-schema',{recursive:true,force:true})"\nlink_pkg @deepseek-ai/cordis "$CHECKOUT/vendor/cordis"\nlink_pkg cosmokit "$CHECKOUT/vendor/cosmokit"\nlink_pkg @deepseek-ai/schemastery "$CHECKOUT/vendor/schemastery"\nlink_pkg @deepseek-ai/dsh-tools "$CHECKOUT/packages/core/tools"\nlink_pkg @types/node "$CHECKOUT/node_modules/@types/node"\n"$TSC" -p tsconfig.json\n`, 'utf8')
         const checkout = detectCheckout()
         if (!checkout) { check('checkout 探测', false, '无 DSH_CHECKOUT'); return summarize(results) }
         // ── 2. 构建测试插件 ──
