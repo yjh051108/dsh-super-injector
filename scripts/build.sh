@@ -45,6 +45,23 @@ link_pkg @deepseek-ai/dsh-tools packages/core/tools
 link_pkg @deepseek-ai/dsh-system-prompt packages/core/system-prompt
 link_pkg @deepseek-ai/cordis-plugin-loader vendor/loader
 
+# @types/node：tsconfig 写了 types:["node"]，缺它就 TS2688 直接编不动（实测踩坑：
+# 没有 node_modules 的干净检出/换机器即构建失败——产线必须自洽，不靠某台机器的残留）。
+TYPES_NODE="$CHECKOUT/node_modules/@types/node"
+if [ ! -d "$TYPES_NODE" ]; then
+  echo "build: @types/node not found at $TYPES_NODE" >&2
+  exit 1
+fi
+node -e "
+  const fs = require('fs');
+  const path = require('path');
+  const link = path.resolve('node_modules/@types/node');
+  const target = path.resolve(process.argv[1]);
+  fs.rmSync(link, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(link), { recursive: true });
+  fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+" "$TYPES_NODE"
+
 STD_SCHEMA=$(find "$CHECKOUT/node_modules/.pnpm" -maxdepth 1 -type d -iname '@standard-schema+spec@*' 2>/dev/null | head -1)
 if [ -n "$STD_SCHEMA" ]; then
   node -e "
