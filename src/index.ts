@@ -2339,9 +2339,21 @@ export function apply(ctx: AppContext, config: Config): void {
       }
       // client 产物
       if (hasClient) {
-        const libClient = join(base, 'lib', 'client.js')
+        // 客户端入口按 package.json 的 exports["./client"] 解析：dshmarket 1.49+
+        // 把产物放在 client/client.js，硬编码 lib/client.js 会把完好的包误判成缺产物而阻断重载。
+        const libClient = (() => {
+          try {
+            const manifest = JSON.parse(readFileSync(join(base, 'package.json'), 'utf8')) as { exports?: Record<string, unknown> }
+            const entry = manifest.exports?.['./client']
+            const declared = typeof entry === 'string'
+              ? entry
+              : entry !== null && typeof entry === 'object' ? String((entry as { default?: unknown }).default ?? '') : ''
+            if (declared !== '') return join(base, declared.replace(/^\.\//, ''))
+          } catch { /* 读不到 manifest 时回退历史布局 */ }
+          return join(base, 'lib', 'client.js')
+        })()
         if (!existsSync(libClient)) {
-          block.push('lib/client.js 不存在（package.json 声明了 dsh.client 但没构建 client——先 npm run build:client，否则前端必挂）')
+          block.push('client 产物不存在（package.json 声明了 dsh.client，但 exports["./client"] 与 lib/client.js 都找不到——先 npm run build:client，否则前端必挂）')
         } else {
           try {
             const content = readFileSync(libClient, 'utf8')
