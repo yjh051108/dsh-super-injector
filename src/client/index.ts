@@ -6,6 +6,7 @@
  * 通信：同源 fetch → host webServer API（/super-injector/api）
  */
 import type { SlotsService } from '@deepseek-ai/dsh-client-ui-slots'
+import * as React from 'react'
 
 type ClientContext = {
   slots: SlotsService
@@ -58,8 +59,35 @@ export function apply(ctx: ClientContext): void {
       id: 'super-injector-plugins',
       order: 50,
       label: () => '插件',
-      component: () => ({
-        render() {
+    }, PluginsPage),
+  ), 'super-injector: settings page')
+}
+
+/**
+ * settings.section 组件。契约要求组件作为 `register` 的第二参数传入（放进 options
+ * 的 `component` 会被丢弃 → React 判定无效组件 → 内容区空白），因此这里按新契约注册，
+ * 并用一个极薄的 React 组件把既有的命令式实现挂载进来。
+ */
+function PluginsPage(): React.ReactElement {
+  const hostRef = React.useRef<HTMLDivElement | null>(null)
+
+  React.useEffect(() => {
+    const built = buildPluginsPage()
+    hostRef.current?.append(built.el)
+    return () => {
+      built.dispose()
+      built.el.remove()
+    }
+  }, [])
+
+  return React.createElement('div', { ref: hostRef })
+}
+
+/**
+ * 命令式构建插件管理页面（原实现整体搬入，交互逻辑未改动；仅把返回值由
+ * `{ dispose }` 改为 `{ el, dispose }`，把根节点交给上面的 React 组件挂载）。
+ */
+function buildPluginsPage(): { el: HTMLElement; dispose: () => void } {
           const style = document.createElement('style')
           style.textContent = styles
 
@@ -156,11 +184,5 @@ export function apply(ctx: ClientContext): void {
           refresh()
           // 60s 轮询刷新（内化会话建好后自动出现）
           const timer = window.setInterval(refresh, 60000)
-          return {
-            dispose: () => window.clearInterval(timer),
-          }
-        },
-      }),
-    }),
-  ), 'super-injector: settings page')
+          return { el: page, dispose: () => window.clearInterval(timer) }
 }
