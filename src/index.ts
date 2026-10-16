@@ -149,7 +149,8 @@ const SCAFFOLD_TSCONFIG = `{
     "forceConsistentCasingInFileNames": true,
     "sourceMap": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["src/client"]
 }
 `
 
@@ -352,7 +353,24 @@ export const Config = z.object({
   title: z.string().default('面板'),
 })
 
-export function apply(ctx: Context, config: Config): void {
+/**
+ * host webServer 服务的最小结构化类型。
+ * ⚠️ 为什么本地声明而不用官方类型：webServer 是 dsh-host-webserver 通过
+ * \`declare module '@deepseek-ai/cordis'\` 做的 Context 增强，只有该包在
+ * 类型解析路径里才可见——合成/精简 checkout 里没有它，生成物当场报
+ * TS2339 Property 'webServer' does not exist on type 'Context'（2026-10 实测）。
+ * 本地交叉类型自足、且不会与真实 checkout 的官方增强冲突（重复声明同名属性
+ * 反而报 TS2717）。注入器自身对 webServer 也是这么处理的。
+ */
+type WebServerLike = {
+  register(route: {
+    kind: 'exact' | 'prefix'
+    path: string
+    handler: (req: any, res: any) => void | Promise<void>
+  }): () => void
+}
+
+export function apply(ctx: Context & { webServer: WebServerLike }, config: Config): void {
   // host API（前缀路由，client 面板消费）
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
@@ -383,17 +401,35 @@ export function apply(ctx: Context, config: Config): void {
 const SCAFFOLD_UI_CLIENT = (pkgName: string): string => `/**
  * ${pkgName} — client 面板（conversation.view slot）。
  * 构建：npm run build:client（tsdown，产物 lib/client.js，ModuleLoader.load 注册）。
- * ⚠️ 两个必坑（2026-08 实测）：① apply 用 ctx.slots 必须 export const inject
- * = ['slots']（服务注入声明）；② register 必须带 name 字段（= slot 名，
- * 如 conversation.view）——缺 name 报 "slot undefined is not declared"。
+ * ⚠️ 三个必坑（2026-08 / 2026-10 实测）：
+ *   ① apply 用 ctx.slots 必须 export const inject = ['slots']（服务注入声明）；
+ *   ② register 必须带 name 字段（= slot 名，如 conversation.view）——缺 name 报
+ *      "slot undefined is not declared"；
+ *   ③ register 的**第二参**才是组件，且必须是返回 ReactNode 的函数
+ *      （SlotComponent<P> = (props: P) => ReactNode）。写成 options.component
+ *      会被静默丢弃（运行时的 entry.options 只保留 key/id/order/label/priority/
+ *      select/inject/children/store/locale/registrant）→ component === undefined →
+ *      槽位渲染空白。旧模板正是踩了这个坑，2026-10 改正。
  */
+import { createElement } from 'react'
 import type { SlotsService } from '@deepseek-ai/dsh-client-ui-slots'
 
 type ClientContext = {
   slots: SlotsService
+  /** cordis 的资源注册口（client fiber 同样挂 effect，卸载/热重载自动清理）。 */
+  effect(fn: () => unknown, label?: string): unknown
 }
 
 export const inject = ['slots']
+
+/** 槽位组件：必须返回 ReactNode（这里用 createElement 免掉 JSX 配置）。 */
+function Panel() {
+  return createElement(
+    'div',
+    { style: { padding: '12px', fontFamily: 'monospace' } },
+    ${JSON.stringify(pkgName)} + ' 面板（host API: /${pkgName}/api）',
+  )
+}
 
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.slots.inject('conversation.view', () =>
@@ -401,16 +437,7 @@ export function apply(ctx: ClientContext): void {
       name: 'conversation.view',
       id: '${pkgName}-panel',
       label: () => ${JSON.stringify(pkgName)},
-      component: () => ({
-        render() {
-          const el = document.createElement('div')
-          el.textContent = ${JSON.stringify(pkgName)} + ' 面板（host API: /${pkgName}/api）'
-          el.style.padding = '12px'
-          el.style.fontFamily = 'monospace'
-          return el
-        },
-      }),
-    }),
+    }, () => createElement(Panel)),
   ), '${pkgName}: panel')
 }
 `
@@ -1062,7 +1089,26 @@ export function apply(ctx: AppContext, config: Config): void {
     }
     const loadCache = (liveCache ?? new Map<string, any>()) as Map<string, any>
 
-    const urlKey = (urlMatch ?? match).replace(/\\/g, '/')
+    // ═══ 物化副本同步（改源码 → build → 重载的闭环）═══
+    // 插件运行在 profile 内的实体副本上（机制见 materializePackage），副本不会
+    // 随源目录变化——不先同步，重载读到的仍是旧副本，热重载等于空转（实测：
+    // 改 src → build → watch 触发 → fiber uid 变了但跑的还是旧代码）。
+    // 因此：重载前按 registry 记录把源目录重新物化到 profile，并把 URL 匹配
+    // 换成 profile 内路径（loadCache key 是 profile 副本的 realpath）。
+    let effectiveUrl = urlMatch
+    if (!matchesSelf(match)) {
+      const synced = rematerialize(match, urlMatch)
+      if (synced.startsWith('ERROR')) return synced
+      try {
+        const reg = readRegistry().find(e => e.name.includes(match) || e.dir.includes(match))
+        if (reg) {
+          const parts = reg.name.startsWith('@') ? reg.name.split('/') : [reg.name]
+          effectiveUrl = join(profileNodeModules, ...parts)
+        }
+      } catch { /* 解析失败退回原 urlMatch */ }
+    }
+
+    const urlKey = (effectiveUrl ?? match).replace(/\\/g, '/')
     let urls = [...loadCache.keys()].filter((u) => {
       if (typeof u !== 'string') return false
       return decodeURIComponent(u).includes(urlKey)
@@ -2192,7 +2238,7 @@ export function apply(ctx: AppContext, config: Config): void {
     } catch { /* 仲裁失败不阻塞 */ }
   }
 
-  /** 注入一个本地插件包：junction → loader.create → 记录清单。 */
+  /** 注入一个本地插件包：物化到 profile（实体副本）→ loader.create → 记录清单。 */
   async function inject(dir: string): Promise<string> {
     const absDir = resolve(dir)
     const pkgPath = join(absDir, 'package.json')
@@ -2213,26 +2259,32 @@ export function apply(ctx: AppContext, config: Config): void {
     if (hasActiveEntry(pkgName)) return `INFO: ${pkgName} 已激活运行，跳过注入`
     purgeCache(absDir)
 
-    // junction 链接到 profile node_modules（scoped 包需要两级目录）
-    // ⚠️ 悬空 junction 必须重建（实测踩坑）：目标目录被删后 existsSync 返回
-    // **false**（跟随链接检查目标）——判断链接存在必须用 lstatSync（链接本身
-    // 还在）。悬空链接复用 → import ENOENT / symlink EEXIST。
+    // 物化到 profile node_modules（scoped 包需要两级目录）——实体副本，不是
+    // junction（机制见 materializePackage 注释：junction 的 realpath 会让宿主
+    // 对 @deepseek-ai/* 的 asar 兜底解析失效 ⇒ entry 建了但 fiber 永不生成）。
+    // ⚠️ 包管理器管理的实体目录绝不覆盖（2026-08 事故：pnpm 安装的真实包被
+    // 换成自指 junction）。判据：目标已是实体目录、且不在我方 registry 里。
     const scoped = pkgName.startsWith('@')
     const parts = scoped ? pkgName.split('/') : [pkgName]
     const linkDir = join(profileNodeModules, ...parts)
+    let copied = 0
     try {
-      let linkExists = false
-      try { linkExists = lstatSync(linkDir).isSymbolicLink() || lstatSync(linkDir).isDirectory() } catch { /* 不存在 */ }
-      if (!linkExists || !isHealthyLink(linkDir)) {
-        if (linkExists) {
-          // ⚠️ 只删链接本身，绝不递归进目标（见 removeLinkOnly 注释）。
-          try { removeLinkOnly(linkDir) } catch { /* 删除失败尝试覆盖 */ }
+      const st = (() => { try { return lstatSync(linkDir) } catch { return null } })()
+      const samePlace = resolve(absDir).toLowerCase() === resolve(linkDir).toLowerCase()
+      if (!samePlace) {
+        const mine = (() => {
+          try { return readRegistry().some(e => e.dir === absDir || e.name === pkgName) } catch { return false }
+        })()
+        const isManaged = st !== null && !st.isSymbolicLink() && !mine
+        if (isManaged) {
+          logger.warn('[super-injector] %s 在 profile 内是实体目录且非本注入器管理，跳过物化（保留包管理器安装）', pkgName)
+        } else {
+          mkdirSync(dirname(linkDir), { recursive: true })
+          copied = materializePackage(absDir, linkDir).files
         }
-        mkdirSync(dirname(linkDir), { recursive: true })
-        symlinkSync(absDir, linkDir, 'junction')
       }
     } catch (e) {
-      return `ERROR: 建立 junction 失败（${linkDir}）: ${String(e)}`
+      return `ERROR: 物化到 profile 失败（${linkDir}）: ${String(e)}`
     }
 
     // 运行时装配
@@ -2254,12 +2306,12 @@ export function apply(ctx: AppContext, config: Config): void {
     const hostOk = hasActiveEntry(pkgName)
     const client = clientStatus(pkgName)
     recordOp('inject', hostOk)
-    return `OK: ${pkgName} 已注入（junction=${linkDir}）\n- host ${hostOk ? '✓' : '✗'}\n- ${client}`
+    return `OK: ${pkgName} 已注入（profile=${linkDir}，物化 ${copied} 文件）\n- host ${hostOk ? '✓' : '✗'}\n- ${client}`
   }
 
-  /** 卸载一个已注入的插件包：卸 entry（fiber dispose）→ 清 registry → 删 junction。 */
+  /** 卸载一个已注入的插件包：卸 entry（fiber dispose）→ 清 registry → 删副本。 */
   async function uninject(match: string, allowSelf = false): Promise<string> {
-    // 自举卸载（allowSelf）：卸运行时 entry，保留 registry/junction/bundles 装配链，重启自动装回。
+    // 自举卸载（allowSelf）：卸运行时 entry，保留 registry/副本 装配链，重启自动装回。
     if (match.includes('super-injector') && !allowSelf) return 'ERROR: 拒绝卸载 dsh-super-injector 自身（引导器不可卸载；自举卸载需 self=true）'
     const steps: string[] = []
     let fullName: string | null = null
@@ -2309,22 +2361,23 @@ export function apply(ctx: AppContext, config: Config): void {
       writeRegistry(after)
       steps.push('registry 已清理')
     }
-    // 3. junction 删除（用完整包名构建路径；rmdir 只删链接不删目标）
+    // 3. profile 副本删除（物化副本是实体目录，须递归删；removeAt 对残留的
+    //    历史 junction 只摘链接不跟进目标，防误删外部源目录）
     if (fullName && !allowSelf) {
       const parts = fullName.startsWith('@') ? fullName.split('/') : [fullName]
       const linkDir = join(profileNodeModules, ...parts)
       try {
-        if (existsSync(linkDir)) {
-          rmdirSync(linkDir)
-          steps.push('junction 已删除: ' + linkDir)
+        if (existsSync(linkDir) || (() => { try { lstatSync(linkDir); return true } catch { return false } })()) {
+          removeAt(linkDir)
+          steps.push('profile 副本已删除: ' + linkDir)
         } else {
-          steps.push('（junction 不存在）')
+          steps.push('（profile 内无该包）')
         }
       } catch (e) {
-        steps.push('junction 删除失败: ' + String(e))
+        steps.push('profile 副本删除失败: ' + String(e))
       }
     } else {
-      steps.push('（未找到完整包名，跳过 junction 清理）')
+      steps.push('（未找到完整包名，跳过副本清理）')
     }
     // 4. client 模块表移除（client-modules 只订阅 internal/plugin 增事件，卸载不自动清）
     if (fullName) {
@@ -2338,6 +2391,82 @@ export function apply(ctx: AppContext, config: Config): void {
     if (entryUnloaded) recordOp('uninject', true)
     else if (!noMatch) recordOp('uninject', false)
     return 'OK: 卸载完成\n- ' + steps.join('\n- ')
+  }
+
+  /** 递归删除一个路径；**符号链接只摘链接本身**（rmdir，绝不跟进目标）。
+   *  与 removeLinkOnly 的区别：本函数会继续下钻真实子目录——物化副本里
+   *  可能残留历史 junction（旧版本注入留下的），必须按类型分派清理。 */
+  function removeAt(p: string): void {
+    try {
+      const st = lstatSync(p)
+      if (st.isSymbolicLink()) { rmdirSync(p); return }
+      if (st.isDirectory()) {
+        for (const name of readdirSync(p)) removeAt(join(p, name))
+        rmdirSync(p)
+        return
+      }
+      rmSync(p, { force: true })
+    } catch { /* 不存在 */ }
+  }
+
+  /**
+   * 物化插件包为 profile 内的**实体目录副本**（不是 junction）。
+   *
+   * ⚠️ 为什么必须实体副本（2026-10 决定性 A/B 实测，本文件历史最大坑）：
+   * Node ESM 解析裸包名按 **realpath** 上溯。junction 让插件 realpath 落回源
+   * 目录（如 D:\...），而宿主（Electron）对 `@deepseek-ai/*` 的兜底解析
+   * （映射进 app.asar）只覆盖 profile / app 内部路径 → 插件 `import
+   * '@deepseek-ai/dsh-tools'` 抛 ERR_MODULE_NOT_FOUND → entry.init() 抛错被
+   * 吞 → entry 建了但 **fiber 永不生成** → hasActiveEntry() 恒 false →
+   * dev_inject_plugin 恒报 `host ✗`（dev_self_test 注入/热重载两项同时 FAIL）。
+   * 同一个包同一份内容对照：junction → host ✗；实体副本 → fiber active →
+   * host ✓。故注入语义 = 物化副本。
+   *
+   * 跳过 node_modules（源目录里的 junction 指向构建用 checkout，拷进来会把
+   * realpath 又拉回外部路径，等于没修）、.git、*.tgz（npm pack 产物）、
+   * node_modules.* 备份残留。
+   */
+  function materializePackage(srcDir: string, dstDir: string): { files: number } {
+    const SKIP = new Set(['node_modules', '.git'])
+    let files = 0
+    const copy = (src: string, dst: string): void => {
+      const st = statSync(src)
+      if (st.isDirectory()) {
+        mkdirSync(dst, { recursive: true })
+        for (const name of readdirSync(src)) {
+          if (SKIP.has(name)) continue
+          if (name.startsWith('node_modules.')) continue
+          if (name.endsWith('.tgz')) continue
+          copy(join(src, name), join(dst, name))
+        }
+        return
+      }
+      if (!st.isFile()) return
+      writeFileSync(dst, readFileSync(src))
+      files++
+    }
+    removeAt(dstDir)
+    mkdirSync(dstDir, { recursive: true })
+    copy(srcDir, dstDir)
+    return { files }
+  }
+
+  /** 把注册表里某包的源目录重新物化到 profile（改代码 → build → 重载的闭环
+   *  需要：实体副本不随源目录变化，重载前必须先同步，否则重载的还是旧副本）。 */
+  function rematerialize(match: string, srcDir?: string): string {
+    try {
+      const reg = readRegistry().find(e => e.name.includes(match) || e.dir.includes(match))
+      const src = srcDir ?? reg?.dir
+      const name = reg?.name
+      if (!src || !name || !existsSync(src)) return ''
+      const parts = name.startsWith('@') ? name.split('/') : [name]
+      const dst = join(profileNodeModules, ...parts)
+      if (resolve(src).toLowerCase() === resolve(dst).toLowerCase()) return ''
+      const r = materializePackage(src, dst)
+      return `${name} → ${r.files} 文件`
+    } catch (e) {
+      return 'ERROR: rematerialize 失败: ' + String(e)
+    }
   }
 
   /** 安全删除链接本身：**绝不递归进目标**。
@@ -3542,8 +3671,23 @@ export function apply(ctx: AppContext, config: Config): void {
       // 2. client 构建（如有声明）
       const scripts = (pkg.scripts ?? {}) as Record<string, string>
       if (typeof scripts['build:client'] === 'string') {
-        const r = npmRun(['run', 'build:client'], pluginDir)
-        if (r === null) return 'ERROR: npm 不可用（需在 PATH）'
+        // 2026-10-16 修复：脚手架声明了 tsdown devDependency，但 build.sh 只做
+        // junction link（编译 host），**从不跑 npm install** → 插件目录没有
+        // node_modules/.bin/tsdown，`npm run build:client` 必然失败
+        // （实测报 '"node"' / 'tsdown' 不是内部或外部命令）。这里按本包
+        // scripts/prepare.mjs 的同款策略兜底：本地 tsdown 缺失时用
+        // npx --yes 拉一个版本（下载后进 npm 缓存，二次构建命中缓存）。
+        const localTsdown = join(pluginDir, 'node_modules', '.bin', process.platform === 'win32' ? 'tsdown.cmd' : 'tsdown')
+        let r: { code: number; output: string } | null
+        if (existsSync(localTsdown)) {
+          r = runCmd(localTsdown, ['--config', 'tsdown.config.ts'], pluginDir)
+        } else {
+          const npxCli = join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npx-cli.js')
+          r = existsSync(npxCli)
+            ? runCmd(process.execPath, [npxCli, '--yes', 'tsdown@^0.22.14', '--config', 'tsdown.config.ts'], pluginDir)
+            : npmRun(['run', 'build:client'], pluginDir)
+        }
+        if (r === null) return 'ERROR: client 构建不可用（tsdown/npm 均未找到）'
         if (r.code !== 0) return `ERROR: build:client 失败（exit ${r.code}）:\n${r.output.slice(-1500)}`
         steps.push('client 构建完成（tsdown → lib/client.js）')
       }
