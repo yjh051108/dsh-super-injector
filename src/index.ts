@@ -1089,7 +1089,26 @@ export function apply(ctx: AppContext, config: Config): void {
     }
     const loadCache = (liveCache ?? new Map<string, any>()) as Map<string, any>
 
-    const urlKey = (urlMatch ?? match).replace(/\\/g, '/')
+    // ═══ 物化副本同步（改源码 → build → 重载的闭环）═══
+    // 插件运行在 profile 内的实体副本上（机制见 materializePackage），副本不会
+    // 随源目录变化——不先同步，重载读到的仍是旧副本，热重载等于空转（实测：
+    // 改 src → build → watch 触发 → fiber uid 变了但跑的还是旧代码）。
+    // 因此：重载前按 registry 记录把源目录重新物化到 profile，并把 URL 匹配
+    // 换成 profile 内路径（loadCache key 是 profile 副本的 realpath）。
+    let effectiveUrl = urlMatch
+    if (!matchesSelf(match)) {
+      const synced = rematerialize(match, urlMatch)
+      if (synced.startsWith('ERROR')) return synced
+      try {
+        const reg = readRegistry().find(e => e.name.includes(match) || e.dir.includes(match))
+        if (reg) {
+          const parts = reg.name.startsWith('@') ? reg.name.split('/') : [reg.name]
+          effectiveUrl = join(profileNodeModules, ...parts)
+        }
+      } catch { /* 解析失败退回原 urlMatch */ }
+    }
+
+    const urlKey = (effectiveUrl ?? match).replace(/\\/g, '/')
     let urls = [...loadCache.keys()].filter((u) => {
       if (typeof u !== 'string') return false
       return decodeURIComponent(u).includes(urlKey)
@@ -2219,7 +2238,7 @@ export function apply(ctx: AppContext, config: Config): void {
     } catch { /* 仲裁失败不阻塞 */ }
   }
 
-  /** 注入一个本地插件包：junction → loader.create → 记录清单。 */
+  /** 注入一个本地插件包：物化到 profile（实体副本）→ loader.create → 记录清单。 */
   async function inject(dir: string): Promise<string> {
     const absDir = resolve(dir)
     const pkgPath = join(absDir, 'package.json')
@@ -2240,26 +2259,32 @@ export function apply(ctx: AppContext, config: Config): void {
     if (hasActiveEntry(pkgName)) return `INFO: ${pkgName} 已激活运行，跳过注入`
     purgeCache(absDir)
 
-    // junction 链接到 profile node_modules（scoped 包需要两级目录）
-    // ⚠️ 悬空 junction 必须重建（实测踩坑）：目标目录被删后 existsSync 返回
-    // **false**（跟随链接检查目标）——判断链接存在必须用 lstatSync（链接本身
-    // 还在）。悬空链接复用 → import ENOENT / symlink EEXIST。
+    // 物化到 profile node_modules（scoped 包需要两级目录）——实体副本，不是
+    // junction（机制见 materializePackage 注释：junction 的 realpath 会让宿主
+    // 对 @deepseek-ai/* 的 asar 兜底解析失效 ⇒ entry 建了但 fiber 永不生成）。
+    // ⚠️ 包管理器管理的实体目录绝不覆盖（2026-08 事故：pnpm 安装的真实包被
+    // 换成自指 junction）。判据：目标已是实体目录、且不在我方 registry 里。
     const scoped = pkgName.startsWith('@')
     const parts = scoped ? pkgName.split('/') : [pkgName]
     const linkDir = join(profileNodeModules, ...parts)
+    let copied = 0
     try {
-      let linkExists = false
-      try { linkExists = lstatSync(linkDir).isSymbolicLink() || lstatSync(linkDir).isDirectory() } catch { /* 不存在 */ }
-      if (!linkExists || !isHealthyLink(linkDir)) {
-        if (linkExists) {
-          // ⚠️ 只删链接本身，绝不递归进目标（见 removeLinkOnly 注释）。
-          try { removeLinkOnly(linkDir) } catch { /* 删除失败尝试覆盖 */ }
+      const st = (() => { try { return lstatSync(linkDir) } catch { return null } })()
+      const samePlace = resolve(absDir).toLowerCase() === resolve(linkDir).toLowerCase()
+      if (!samePlace) {
+        const mine = (() => {
+          try { return readRegistry().some(e => e.dir === absDir || e.name === pkgName) } catch { return false }
+        })()
+        const isManaged = st !== null && !st.isSymbolicLink() && !mine
+        if (isManaged) {
+          logger.warn('[super-injector] %s 在 profile 内是实体目录且非本注入器管理，跳过物化（保留包管理器安装）', pkgName)
+        } else {
+          mkdirSync(dirname(linkDir), { recursive: true })
+          copied = materializePackage(absDir, linkDir).files
         }
-        mkdirSync(dirname(linkDir), { recursive: true })
-        symlinkSync(absDir, linkDir, 'junction')
       }
     } catch (e) {
-      return `ERROR: 建立 junction 失败（${linkDir}）: ${String(e)}`
+      return `ERROR: 物化到 profile 失败（${linkDir}）: ${String(e)}`
     }
 
     // 运行时装配
@@ -2281,12 +2306,12 @@ export function apply(ctx: AppContext, config: Config): void {
     const hostOk = hasActiveEntry(pkgName)
     const client = clientStatus(pkgName)
     recordOp('inject', hostOk)
-    return `OK: ${pkgName} 已注入（junction=${linkDir}）\n- host ${hostOk ? '✓' : '✗'}\n- ${client}`
+    return `OK: ${pkgName} 已注入（profile=${linkDir}，物化 ${copied} 文件）\n- host ${hostOk ? '✓' : '✗'}\n- ${client}`
   }
 
-  /** 卸载一个已注入的插件包：卸 entry（fiber dispose）→ 清 registry → 删 junction。 */
+  /** 卸载一个已注入的插件包：卸 entry（fiber dispose）→ 清 registry → 删副本。 */
   async function uninject(match: string, allowSelf = false): Promise<string> {
-    // 自举卸载（allowSelf）：卸运行时 entry，保留 registry/junction/bundles 装配链，重启自动装回。
+    // 自举卸载（allowSelf）：卸运行时 entry，保留 registry/副本 装配链，重启自动装回。
     if (match.includes('super-injector') && !allowSelf) return 'ERROR: 拒绝卸载 dsh-super-injector 自身（引导器不可卸载；自举卸载需 self=true）'
     const steps: string[] = []
     let fullName: string | null = null
@@ -2336,22 +2361,23 @@ export function apply(ctx: AppContext, config: Config): void {
       writeRegistry(after)
       steps.push('registry 已清理')
     }
-    // 3. junction 删除（用完整包名构建路径；rmdir 只删链接不删目标）
+    // 3. profile 副本删除（物化副本是实体目录，须递归删；removeAt 对残留的
+    //    历史 junction 只摘链接不跟进目标，防误删外部源目录）
     if (fullName && !allowSelf) {
       const parts = fullName.startsWith('@') ? fullName.split('/') : [fullName]
       const linkDir = join(profileNodeModules, ...parts)
       try {
-        if (existsSync(linkDir)) {
-          rmdirSync(linkDir)
-          steps.push('junction 已删除: ' + linkDir)
+        if (existsSync(linkDir) || (() => { try { lstatSync(linkDir); return true } catch { return false } })()) {
+          removeAt(linkDir)
+          steps.push('profile 副本已删除: ' + linkDir)
         } else {
-          steps.push('（junction 不存在）')
+          steps.push('（profile 内无该包）')
         }
       } catch (e) {
-        steps.push('junction 删除失败: ' + String(e))
+        steps.push('profile 副本删除失败: ' + String(e))
       }
     } else {
-      steps.push('（未找到完整包名，跳过 junction 清理）')
+      steps.push('（未找到完整包名，跳过副本清理）')
     }
     // 4. client 模块表移除（client-modules 只订阅 internal/plugin 增事件，卸载不自动清）
     if (fullName) {
@@ -2365,6 +2391,82 @@ export function apply(ctx: AppContext, config: Config): void {
     if (entryUnloaded) recordOp('uninject', true)
     else if (!noMatch) recordOp('uninject', false)
     return 'OK: 卸载完成\n- ' + steps.join('\n- ')
+  }
+
+  /** 递归删除一个路径；**符号链接只摘链接本身**（rmdir，绝不跟进目标）。
+   *  与 removeLinkOnly 的区别：本函数会继续下钻真实子目录——物化副本里
+   *  可能残留历史 junction（旧版本注入留下的），必须按类型分派清理。 */
+  function removeAt(p: string): void {
+    try {
+      const st = lstatSync(p)
+      if (st.isSymbolicLink()) { rmdirSync(p); return }
+      if (st.isDirectory()) {
+        for (const name of readdirSync(p)) removeAt(join(p, name))
+        rmdirSync(p)
+        return
+      }
+      rmSync(p, { force: true })
+    } catch { /* 不存在 */ }
+  }
+
+  /**
+   * 物化插件包为 profile 内的**实体目录副本**（不是 junction）。
+   *
+   * ⚠️ 为什么必须实体副本（2026-10 决定性 A/B 实测，本文件历史最大坑）：
+   * Node ESM 解析裸包名按 **realpath** 上溯。junction 让插件 realpath 落回源
+   * 目录（如 D:\...），而宿主（Electron）对 `@deepseek-ai/*` 的兜底解析
+   * （映射进 app.asar）只覆盖 profile / app 内部路径 → 插件 `import
+   * '@deepseek-ai/dsh-tools'` 抛 ERR_MODULE_NOT_FOUND → entry.init() 抛错被
+   * 吞 → entry 建了但 **fiber 永不生成** → hasActiveEntry() 恒 false →
+   * dev_inject_plugin 恒报 `host ✗`（dev_self_test 注入/热重载两项同时 FAIL）。
+   * 同一个包同一份内容对照：junction → host ✗；实体副本 → fiber active →
+   * host ✓。故注入语义 = 物化副本。
+   *
+   * 跳过 node_modules（源目录里的 junction 指向构建用 checkout，拷进来会把
+   * realpath 又拉回外部路径，等于没修）、.git、*.tgz（npm pack 产物）、
+   * node_modules.* 备份残留。
+   */
+  function materializePackage(srcDir: string, dstDir: string): { files: number } {
+    const SKIP = new Set(['node_modules', '.git'])
+    let files = 0
+    const copy = (src: string, dst: string): void => {
+      const st = statSync(src)
+      if (st.isDirectory()) {
+        mkdirSync(dst, { recursive: true })
+        for (const name of readdirSync(src)) {
+          if (SKIP.has(name)) continue
+          if (name.startsWith('node_modules.')) continue
+          if (name.endsWith('.tgz')) continue
+          copy(join(src, name), join(dst, name))
+        }
+        return
+      }
+      if (!st.isFile()) return
+      writeFileSync(dst, readFileSync(src))
+      files++
+    }
+    removeAt(dstDir)
+    mkdirSync(dstDir, { recursive: true })
+    copy(srcDir, dstDir)
+    return { files }
+  }
+
+  /** 把注册表里某包的源目录重新物化到 profile（改代码 → build → 重载的闭环
+   *  需要：实体副本不随源目录变化，重载前必须先同步，否则重载的还是旧副本）。 */
+  function rematerialize(match: string, srcDir?: string): string {
+    try {
+      const reg = readRegistry().find(e => e.name.includes(match) || e.dir.includes(match))
+      const src = srcDir ?? reg?.dir
+      const name = reg?.name
+      if (!src || !name || !existsSync(src)) return ''
+      const parts = name.startsWith('@') ? name.split('/') : [name]
+      const dst = join(profileNodeModules, ...parts)
+      if (resolve(src).toLowerCase() === resolve(dst).toLowerCase()) return ''
+      const r = materializePackage(src, dst)
+      return `${name} → ${r.files} 文件`
+    } catch (e) {
+      return 'ERROR: rematerialize 失败: ' + String(e)
+    }
   }
 
   /** 安全删除链接本身：**绝不递归进目标**。
