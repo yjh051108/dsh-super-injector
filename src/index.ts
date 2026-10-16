@@ -149,7 +149,8 @@ const SCAFFOLD_TSCONFIG = `{
     "forceConsistentCasingInFileNames": true,
     "sourceMap": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["src/client"]
 }
 `
 
