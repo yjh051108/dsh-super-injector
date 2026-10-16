@@ -353,7 +353,24 @@ export const Config = z.object({
   title: z.string().default('面板'),
 })
 
-export function apply(ctx: Context, config: Config): void {
+/**
+ * host webServer 服务的最小结构化类型。
+ * ⚠️ 为什么本地声明而不用官方类型：webServer 是 dsh-host-webserver 通过
+ * \`declare module '@deepseek-ai/cordis'\` 做的 Context 增强，只有该包在
+ * 类型解析路径里才可见——合成/精简 checkout 里没有它，生成物当场报
+ * TS2339 Property 'webServer' does not exist on type 'Context'（2026-10 实测）。
+ * 本地交叉类型自足、且不会与真实 checkout 的官方增强冲突（重复声明同名属性
+ * 反而报 TS2717）。注入器自身对 webServer 也是这么处理的。
+ */
+type WebServerLike = {
+  register(route: {
+    kind: 'exact' | 'prefix'
+    path: string
+    handler: (req: any, res: any) => void | Promise<void>
+  }): () => void
+}
+
+export function apply(ctx: Context & { webServer: WebServerLike }, config: Config): void {
   // host API（前缀路由，client 面板消费）
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
