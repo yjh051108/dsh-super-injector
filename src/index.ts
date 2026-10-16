@@ -3671,8 +3671,23 @@ export function apply(ctx: AppContext, config: Config): void {
       // 2. client 构建（如有声明）
       const scripts = (pkg.scripts ?? {}) as Record<string, string>
       if (typeof scripts['build:client'] === 'string') {
-        const r = npmRun(['run', 'build:client'], pluginDir)
-        if (r === null) return 'ERROR: npm 不可用（需在 PATH）'
+        // 2026-10-16 修复：脚手架声明了 tsdown devDependency，但 build.sh 只做
+        // junction link（编译 host），**从不跑 npm install** → 插件目录没有
+        // node_modules/.bin/tsdown，`npm run build:client` 必然失败
+        // （实测报 '"node"' / 'tsdown' 不是内部或外部命令）。这里按本包
+        // scripts/prepare.mjs 的同款策略兜底：本地 tsdown 缺失时用
+        // npx --yes 拉一个版本（下载后进 npm 缓存，二次构建命中缓存）。
+        const localTsdown = join(pluginDir, 'node_modules', '.bin', process.platform === 'win32' ? 'tsdown.cmd' : 'tsdown')
+        let r: { code: number; output: string } | null
+        if (existsSync(localTsdown)) {
+          r = runCmd(localTsdown, ['--config', 'tsdown.config.ts'], pluginDir)
+        } else {
+          const npxCli = join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npx-cli.js')
+          r = existsSync(npxCli)
+            ? runCmd(process.execPath, [npxCli, '--yes', 'tsdown@^0.22.14', '--config', 'tsdown.config.ts'], pluginDir)
+            : npmRun(['run', 'build:client'], pluginDir)
+        }
+        if (r === null) return 'ERROR: client 构建不可用（tsdown/npm 均未找到）'
         if (r.code !== 0) return `ERROR: build:client 失败（exit ${r.code}）:\n${r.output.slice(-1500)}`
         steps.push('client 构建完成（tsdown → lib/client.js）')
       }
