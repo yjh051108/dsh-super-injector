@@ -401,17 +401,35 @@ export function apply(ctx: Context & { webServer: WebServerLike }, config: Confi
 const SCAFFOLD_UI_CLIENT = (pkgName: string): string => `/**
  * ${pkgName} — client 面板（conversation.view slot）。
  * 构建：npm run build:client（tsdown，产物 lib/client.js，ModuleLoader.load 注册）。
- * ⚠️ 两个必坑（2026-08 实测）：① apply 用 ctx.slots 必须 export const inject
- * = ['slots']（服务注入声明）；② register 必须带 name 字段（= slot 名，
- * 如 conversation.view）——缺 name 报 "slot undefined is not declared"。
+ * ⚠️ 三个必坑（2026-08 / 2026-10 实测）：
+ *   ① apply 用 ctx.slots 必须 export const inject = ['slots']（服务注入声明）；
+ *   ② register 必须带 name 字段（= slot 名，如 conversation.view）——缺 name 报
+ *      "slot undefined is not declared"；
+ *   ③ register 的**第二参**才是组件，且必须是返回 ReactNode 的函数
+ *      （SlotComponent<P> = (props: P) => ReactNode）。写成 options.component
+ *      会被静默丢弃（运行时的 entry.options 只保留 key/id/order/label/priority/
+ *      select/inject/children/store/locale/registrant）→ component === undefined →
+ *      槽位渲染空白。旧模板正是踩了这个坑，2026-10 改正。
  */
+import { createElement } from 'react'
 import type { SlotsService } from '@deepseek-ai/dsh-client-ui-slots'
 
 type ClientContext = {
   slots: SlotsService
+  /** cordis 的资源注册口（client fiber 同样挂 effect，卸载/热重载自动清理）。 */
+  effect(fn: () => unknown, label?: string): unknown
 }
 
 export const inject = ['slots']
+
+/** 槽位组件：必须返回 ReactNode（这里用 createElement 免掉 JSX 配置）。 */
+function Panel() {
+  return createElement(
+    'div',
+    { style: { padding: '12px', fontFamily: 'monospace' } },
+    ${JSON.stringify(pkgName)} + ' 面板（host API: /${pkgName}/api）',
+  )
+}
 
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.slots.inject('conversation.view', () =>
@@ -419,16 +437,7 @@ export function apply(ctx: ClientContext): void {
       name: 'conversation.view',
       id: '${pkgName}-panel',
       label: () => ${JSON.stringify(pkgName)},
-      component: () => ({
-        render() {
-          const el = document.createElement('div')
-          el.textContent = ${JSON.stringify(pkgName)} + ' 面板（host API: /${pkgName}/api）'
-          el.style.padding = '12px'
-          el.style.fontFamily = 'monospace'
-          return el
-        },
-      }),
-    }),
+    }, () => createElement(Panel)),
   ), '${pkgName}: panel')
 }
 `
